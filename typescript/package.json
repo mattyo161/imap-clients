@@ -1,0 +1,25 @@
+{
+  "name": "imap-cli-ts",
+  "version": "1.0.0",
+  "description": "Universal IMAP client CLI (TypeScript)",
+  "main": "dist/index.js",
+  "bin": { "imap-cli": "./dist/index.js" },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "ts-node src/index.ts"
+  },
+  "dependencies": {
+    "better-sqlite3": "^9.4.3",
+    "commander": "^12.0.0",
+    "imapflow": "^1.0.162",
+    "mailparser": "^3.7.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.9",
+    "@types/mailparser": "^3.4.4",
+    "@types/node": "^20.0.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.3.0"
+  }
+}
