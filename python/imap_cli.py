@@ -171,10 +171,23 @@ def parse_body(raw: bytes) -> Tuple[str, str, List[Dict]]:
     return body_text, body_html, attachments
 
 
-def parse_headers(raw: bytes) -> Dict[str, str]:
+def parse_headers(raw: bytes) -> Dict[str, Any]:
+    """
+    Extract top-level headers as {name: value_or_list}.
+    Headers that appear once → string value.
+    Headers that appear multiple times (e.g. Received:) → list of strings.
+    Values are RFC 2047-decoded.
+    """
     try:
         msg = email_lib.message_from_bytes(raw)
-        return {k: decode_header(v) for k, v in msg.items()}
+        seen: Dict[str, List[str]] = {}
+        for key in msg.keys():
+            vals = [decode_header(v) for v in (msg.get_all(key) or [])]
+            if key in seen:
+                seen[key].extend(vals)
+            else:
+                seen[key] = vals
+        return {k: v[0] if len(v) == 1 else v for k, v in seen.items()}
     except Exception:
         return {}
 
@@ -371,6 +384,28 @@ class ConnectionPool:
 
 
 # ---------------------------------------------------------------------------
+# Date helpers
+# ---------------------------------------------------------------------------
+
+_IMAP_MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+
+def _to_imap_date(value: str) -> str:
+    """
+    Accept ISO date (YYYY-MM-DD) or IMAP date (DD-Mon-YYYY) and always
+    return IMAP format.  Unknown formats are passed through unchanged.
+    """
+    if not value:
+        return value
+    try:
+        dt = datetime.strptime(value.strip(), "%Y-%m-%d")
+        return f"{dt.day:02d}-{_IMAP_MONTHS[dt.month - 1]}-{dt.year}"
+    except ValueError:
+        return value  # already IMAP format or unrecognised — leave as-is
+
+
+# ---------------------------------------------------------------------------
 # IMAP operations
 # ---------------------------------------------------------------------------
 
@@ -433,9 +468,9 @@ def op_messages(pool: ConnectionPool, mailbox: str,
 
         criteria: List[Any] = []
         if since:
-            criteria += ["SINCE", since]
+            criteria += ["SINCE", _to_imap_date(since)]
         if before:
-            criteria += ["BEFORE", before]
+            criteria += ["BEFORE", _to_imap_date(before)]
         if not criteria:
             criteria = ["ALL"]
 
@@ -454,7 +489,7 @@ def op_messages(pool: ConnectionPool, mailbox: str,
             batch = uids[i: i + FETCH_BATCH]
             for attempt in range(pool.max_retries):
                 try:
-                    data = conn.fetch(batch, ["ENVELOPE", "FLAGS", "RFC822.SIZE"])
+                    data = conn.fetch(batch, ["ENVELOPE", "FLAGS", "RFC822.SIZE", "INTERNALDATE"])
                     break
                 except Exception as exc:
                     if attempt >= pool.max_retries - 1:
@@ -468,11 +503,13 @@ def op_messages(pool: ConnectionPool, mailbox: str,
                 if env_raw is None:
                     continue
                 env = parse_envelope(env_raw)
+                internal_date_raw = item.get(b"INTERNALDATE")
                 results.append({
                     "type": "message",
                     "mailbox": mailbox,
                     "uid": uid,
                     **env,
+                    "internal_date": parse_date(internal_date_raw) if internal_date_raw else "",
                     "size": item.get(b"RFC822.SIZE", 0),
                     "flags": flags_to_list(item.get(b"FLAGS", [])),
                 })
@@ -500,7 +537,7 @@ def op_fetch(pool: ConnectionPool, mailbox: str, uid: int,
 
         for attempt in range(pool.max_retries):
             try:
-                data = conn.fetch([uid], ["ENVELOPE", "FLAGS", "RFC822.SIZE", "RFC822"])
+                data = conn.fetch([uid], ["ENVELOPE", "FLAGS", "RFC822.SIZE", "INTERNALDATE", "RFC822"])
                 break
             except Exception as exc:
                 if attempt >= pool.max_retries - 1:
@@ -516,6 +553,7 @@ def op_fetch(pool: ConnectionPool, mailbox: str, uid: int,
             return None
 
         env = parse_envelope(env_raw)
+        internal_date_raw = item.get(b"INTERNALDATE")
         raw = item.get(b"RFC822", b"")
         body_text, body_html, atts = parse_body(raw)
         hdrs = parse_headers(raw)
@@ -525,6 +563,7 @@ def op_fetch(pool: ConnectionPool, mailbox: str, uid: int,
             "mailbox": mailbox,
             "uid": uid,
             **env,
+            "internal_date": parse_date(internal_date_raw) if internal_date_raw else "",
             "size": item.get(b"RFC822.SIZE", 0),
             "flags": flags_to_list(item.get(b"FLAGS", [])),
             "headers": hdrs,
@@ -649,7 +688,10 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--port", type=int, default=0,
                    help="IMAP port (0 = auto: 993 SSL / 143 plain)")
     g.add_argument("--user", required=True, help="Username / email")
-    g.add_argument("--password", required=True, help="Password")
+    g.add_argument("--password", default=None,
+                   help="Password (plain text; prefer --password-env)")
+    g.add_argument("--password-env", default=None, metavar="VAR",
+                   help="Name of env var holding the password")
     g.add_argument("--no-ssl", action="store_true", help="Disable TLS")
     g.add_argument("--pool-size", type=int, default=5, metavar="N")
     g.add_argument("--throttle-delay", type=float, default=0.0, metavar="SEC")
@@ -693,6 +735,19 @@ def main():
         format="%(asctime)s %(levelname)s %(message)s",
     )
 
+    # Resolve password — env var takes precedence over --password
+    password: str = ""
+    if args.password_env:
+        password = os.environ.get(args.password_env, "")
+        if not password:
+            emit_err(f"Environment variable {args.password_env!r} is not set or empty")
+            sys.exit(1)
+    elif args.password:
+        password = args.password
+    else:
+        emit_err("No password provided. Use --password PASS or --password-env VAR")
+        sys.exit(1)
+
     port = args.port or (143 if args.no_ssl else 993)
 
     cache: Optional[Cache] = None
@@ -703,7 +758,7 @@ def main():
 
     pool = ConnectionPool(
         host=args.host, port=port,
-        user=args.user, password=args.password,
+        user=args.user, password=password,
         ssl=not args.no_ssl,
         pool_size=args.pool_size,
         throttle_delay=args.throttle_delay,
