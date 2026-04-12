@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "git fetch origin --prune 2>/dev/null; branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null); if [ -z \"$branch\" ] || [ \"$branch\" = \"main\" ] || [ \"$branch\" = \"HEAD\" ]; then exit 0; fi; if ! git ls-remote --exit-code --heads origin \"$branch\" > /dev/null 2>&1; then echo \"Branch \\\"$branch\\\" was deleted from remote (merged). Switching to main.\"; git checkout main && git pull origin main; elif git merge-base --is-ancestor \"origin/$branch\" origin/main 2>/dev/null; then echo \"Branch \\\"$branch\\\" has been merged into main. Switching to main.\"; git checkout main && git pull origin main; fi",
+            "statusMessage": "Checking branch status..."
+          }
+        ]
+      }
+    ]
+  }
+}
