@@ -32,6 +32,8 @@ except ImportError:
 
 log = logging.getLogger(__name__)
 _output_lock = threading.Lock()
+_PID = os.getpid()
+_call_cached = threading.local()   # per-thread flag set by op_* to signal cache hit
 FETCH_BATCH = 200  # UIDs per FETCH command
 
 
@@ -311,12 +313,46 @@ class Cache:
 # Connection pool
 # ---------------------------------------------------------------------------
 
+class _ResizableSemaphore:
+    """
+    A semaphore whose upper limit can be changed at runtime.
+    Used to dynamically reduce active IMAP connections when the server
+    signals throttling, then restore once requests succeed again.
+    """
+
+    def __init__(self, limit: int) -> None:
+        self._limit = limit
+        self._count = 0
+        self._cond = threading.Condition(threading.Lock())
+
+    def acquire(self) -> None:
+        with self._cond:
+            while self._count >= self._limit:
+                self._cond.wait(timeout=0.5)  # re-check periodically
+            self._count += 1
+
+    def release(self) -> None:
+        with self._cond:
+            self._count -= 1
+            self._cond.notify_all()
+
+    def set_limit(self, new_limit: int) -> None:
+        with self._cond:
+            self._limit = max(1, new_limit)
+            self._cond.notify_all()
+
+    @property
+    def limit(self) -> int:
+        with self._cond:
+            return self._limit
+
+
 class ConnectionPool:
     """Thread-safe pool of authenticated IMAPClient connections."""
 
     def __init__(self, host: str, port: int, user: str, password: str,
                  ssl: bool, pool_size: int = 5,
-                 throttle_delay: float = 0.0, max_retries: int = 3):
+                 throttle_delay: float = 0.0, max_retries: int = 5):
         self.host = host
         self.port = port
         self.user = user
@@ -326,7 +362,59 @@ class ConnectionPool:
         self.throttle_delay = throttle_delay
         self.max_retries = max_retries
         self._pool: queue.Queue = queue.Queue(maxsize=pool_size)
-        self._sem = threading.Semaphore(pool_size)
+        self._sem = _ResizableSemaphore(pool_size)
+        self._throttle_lock = threading.Lock()
+        self._throttle_events: int = 0  # count of in-flight throttle recoveries
+        self._backoff_until: float = 0.0  # monotonic timestamp: don't acquire before this
+        self._conn_id_counter: int = 0    # incremented per new connection
+
+    # -- throttle management -------------------------------------------------
+
+    def _flush_idle(self) -> None:
+        """Drain and close all idle connections sitting in the pool queue."""
+        while True:
+            try:
+                conn = self._pool.get_nowait()
+                try:
+                    conn.logout()
+                except Exception:
+                    pass
+            except queue.Empty:
+                break
+
+    def on_throttle(self, backoff_seconds: float = 0.0) -> None:
+        """
+        Called when any IMAP operation receives a server error.
+        Reduces active concurrency to 1, extends the global backoff deadline,
+        and flushes idle connections so retries start with fresh ones.
+        """
+        with self._throttle_lock:
+            self._throttle_events += 1
+            deadline = time.monotonic() + backoff_seconds
+            if deadline > self._backoff_until:
+                self._backoff_until = deadline
+            self._sem.set_limit(1)
+            log.debug(
+                "throttle detected — reducing pool concurrency to 1 "
+                "(throttle_events=%d, backoff=%.1fs)", self._throttle_events, backoff_seconds
+            )
+        self._flush_idle()
+
+    def on_success(self) -> None:
+        """
+        Called after a successful IMAP operation.
+        Decrements the throttle event counter and restores full concurrency
+        once all in-flight recoveries have completed.
+        """
+        with self._throttle_lock:
+            if self._throttle_events > 0:
+                self._throttle_events -= 1
+            if self._throttle_events == 0 and self._sem.limit < self.pool_size:
+                self._sem.set_limit(self.pool_size)
+                log.debug("throttle cleared — restoring pool concurrency to %d",
+                          self.pool_size)
+
+    # -- connection lifecycle ------------------------------------------------
 
     def _new_conn(self) -> IMAPClient:
         for attempt in range(self.max_retries):
@@ -336,18 +424,28 @@ class ConnectionPool:
                     ssl=self.ssl, use_uid=True, timeout=30,
                 )
                 c.login(self.user, self.password)
+                with self._throttle_lock:
+                    self._conn_id_counter += 1
+                    conn_id = self._conn_id_counter
+                c._imap_cli_conn_id = conn_id  # type: ignore[attr-defined]
                 return c
             except Exception as exc:
                 if attempt >= self.max_retries - 1:
                     raise
-                delay = (2 ** attempt) * max(0.5, self.throttle_delay)
-                log.warning("connect attempt %d failed: %s — retry in %.1fs", attempt + 1, exc, delay)
-                time.sleep(delay)
+                delay = 5 * (2 ** attempt)
+                emit_pause(delay, api="connect", attempt=attempt + 1,
+                           error=str(exc))
         raise RuntimeError("unreachable")
 
     @contextlib.contextmanager
     def acquire(self):
         """Yield a live IMAPClient; return it to the pool afterwards."""
+        # Honour the global backoff deadline before competing for a slot.
+        while True:
+            remaining = self._backoff_until - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(remaining, 0.5))
         self._sem.acquire()
         conn = None
         try:
@@ -415,8 +513,10 @@ def op_mailboxes(pool: ConnectionPool, cache: Optional[Cache],
         cached = cache.get_mailboxes()
         if cached is not None:
             log.debug("mailboxes: cache hit (%d)", len(cached))
+            _call_cached.value = True
             yield from cached
             return
+    _call_cached.value = False
 
     results: List[Dict] = []
     with pool.acquire() as conn:
@@ -438,7 +538,8 @@ def op_mailboxes(pool: ConnectionPool, cache: Optional[Cache],
                 obj["exists"] = st.get(b"MESSAGES", 0)
                 obj["unseen"] = st.get(b"UNSEEN", 0)
             except Exception as exc:
-                log.debug("folder_status(%s): %s", name, exc)
+                emit_err(str(exc), api="mailboxes", mailbox=name,
+                         error_code=_imap_error_code(exc))
             results.append(obj)
 
     if cache:
@@ -454,65 +555,74 @@ def op_messages(pool: ConnectionPool, mailbox: str,
         cached = cache.get_messages(mailbox)
         if cached is not None:
             log.debug("messages: cache hit for %s (%d)", mailbox, len(cached))
+            _call_cached.value = True
             items = cached if not limit else cached[-limit:]
             yield from items
             return
+    _call_cached.value = False
+
+    criteria: List[Any] = []
+    if since:
+        criteria += ["SINCE", _to_imap_date(since)]
+    if before:
+        criteria += ["BEFORE", _to_imap_date(before)]
+    if not criteria:
+        criteria = ["ALL"]
 
     results: List[Dict] = []
-    with pool.acquire() as conn:
+    last_exc: Optional[Exception] = None
+
+    for attempt in range(pool.max_retries):
         try:
-            conn.select_folder(mailbox, readonly=True)
-        except Exception as exc:
-            log.error("select_folder(%s): %s", mailbox, exc)
-            return
-
-        criteria: List[Any] = []
-        if since:
-            criteria += ["SINCE", _to_imap_date(since)]
-        if before:
-            criteria += ["BEFORE", _to_imap_date(before)]
-        if not criteria:
-            criteria = ["ALL"]
-
-        try:
-            uids: List[int] = conn.search(criteria)
-        except Exception as exc:
-            log.error("search(%s): %s", mailbox, exc)
-            return
-
-        if not uids:
-            return
-        if limit:
-            uids = uids[-limit:]
-
-        for i in range(0, len(uids), FETCH_BATCH):
-            batch = uids[i: i + FETCH_BATCH]
-            for attempt in range(pool.max_retries):
-                try:
+            results = []
+            with pool.acquire() as conn:
+                # select_folder, search, and all batch fetches are inside a
+                # single pool.acquire() so that any IMAP error causes the
+                # connection to be discarded and a fresh one opened on retry.
+                conn.select_folder(mailbox, readonly=True)
+                uids: List[int] = conn.search(criteria)
+                if limit:
+                    uids = uids[-limit:]
+                for i in range(0, len(uids), FETCH_BATCH):
+                    batch = uids[i: i + FETCH_BATCH]
                     data = conn.fetch(batch, ["ENVELOPE", "FLAGS", "RFC822.SIZE", "INTERNALDATE"])
-                    break
-                except Exception as exc:
-                    if attempt >= pool.max_retries - 1:
-                        log.error("fetch batch: %s", exc)
-                        data = {}
-                    else:
-                        time.sleep(2 ** attempt)
-
-            for uid, item in data.items():
-                env_raw = item.get(b"ENVELOPE")
-                if env_raw is None:
-                    continue
-                env = parse_envelope(env_raw)
-                internal_date_raw = item.get(b"INTERNALDATE")
-                results.append({
-                    "type": "message",
-                    "mailbox": mailbox,
-                    "uid": uid,
-                    **env,
-                    "internal_date": parse_date(internal_date_raw) if internal_date_raw else "",
-                    "size": item.get(b"RFC822.SIZE", 0),
-                    "flags": flags_to_list(item.get(b"FLAGS", [])),
-                })
+                    for uid, item in data.items():
+                        env_raw = item.get(b"ENVELOPE")
+                        if env_raw is None:
+                            continue
+                        env = parse_envelope(env_raw)
+                        internal_date_raw = item.get(b"INTERNALDATE")
+                        results.append({
+                            "type": "message",
+                            "mailbox": mailbox,
+                            "uid": uid,
+                            **env,
+                            "internal_date": parse_date(internal_date_raw) if internal_date_raw else "",
+                            "size": item.get(b"RFC822.SIZE", 0),
+                            "flags": flags_to_list(item.get(b"FLAGS", [])),
+                        })
+            pool.on_success()
+            break  # success — exit retry loop
+        except Exception as exc:
+            last_exc = exc
+            results = []
+            delay = 5 * (2 ** attempt)
+            pool.on_throttle(delay)
+            if attempt < pool.max_retries - 1:
+                if _progress:
+                    _progress.start_pause()
+                try:
+                    emit_pause(delay, api="messages",
+                               mailbox=mailbox, attempt=attempt + 1,
+                               error=str(exc))
+                finally:
+                    if _progress:
+                        _progress.end_pause()
+    else:
+        # All attempts exhausted
+        emit_err(str(last_exc), api="messages", mailbox=mailbox,
+                 error_code=_imap_error_code(last_exc), failed=True)
+        return
 
     if cache and results:
         cache.set_messages(mailbox, results)
@@ -526,51 +636,72 @@ def op_fetch(pool: ConnectionPool, mailbox: str, uid: int,
         cached = cache.get_message_content(mailbox, uid)
         if cached is not None:
             log.debug("fetch: cache hit %s/%d", mailbox, uid)
+            _call_cached.value = True
             return cached
+    _call_cached.value = False
 
-    with pool.acquire() as conn:
+    data: Optional[Dict] = None
+    last_exc: Optional[Exception] = None
+
+    for attempt in range(pool.max_retries):
         try:
-            conn.select_folder(mailbox, readonly=True)
+            with pool.acquire() as conn:
+                # Both select_folder and fetch are inside a single pool.acquire()
+                # so that any IMAP error causes the connection to be discarded
+                # and a fresh one opened on the next retry attempt.
+                conn.select_folder(mailbox, readonly=True)
+                data = conn.fetch(
+                    [uid],
+                    ["ENVELOPE", "FLAGS", "RFC822.SIZE", "INTERNALDATE", "RFC822"],
+                )
+            pool.on_success()
+            break  # success — exit retry loop
         except Exception as exc:
-            log.error("select_folder(%s): %s", mailbox, exc)
-            return None
+            last_exc = exc
+            data = None
+            delay = 5 * (2 ** attempt)
+            pool.on_throttle(delay)
+            if attempt < pool.max_retries - 1:
+                if _progress:
+                    _progress.start_pause()
+                try:
+                    emit_pause(delay, api="fetch", mailbox=mailbox,
+                               uid=uid, attempt=attempt + 1, error=str(exc))
+                finally:
+                    if _progress:
+                        _progress.end_pause()
+    else:
+        # All attempts exhausted
+        emit_err(str(last_exc), api="fetch", mailbox=mailbox, uid=uid,
+                 error_code=_imap_error_code(last_exc), failed=True)
+        return None
 
-        for attempt in range(pool.max_retries):
-            try:
-                data = conn.fetch([uid], ["ENVELOPE", "FLAGS", "RFC822.SIZE", "INTERNALDATE", "RFC822"])
-                break
-            except Exception as exc:
-                if attempt >= pool.max_retries - 1:
-                    log.error("fetch(%s/%d): %s", mailbox, uid, exc)
-                    return None
-                time.sleep(2 ** attempt)
+    if data is None or uid not in data:
+        return None
+    item = data[uid]
+    env_raw = item.get(b"ENVELOPE")
+    if env_raw is None:
+        return None
 
-        if uid not in data:
-            return None
-        item = data[uid]
-        env_raw = item.get(b"ENVELOPE")
-        if env_raw is None:
-            return None
+    env = parse_envelope(env_raw)
+    internal_date_raw = item.get(b"INTERNALDATE")
+    raw = item.get(b"RFC822", b"")
+    body_text, body_html, atts = parse_body(raw)
+    hdrs = parse_headers(raw)
 
-        env = parse_envelope(env_raw)
-        internal_date_raw = item.get(b"INTERNALDATE")
-        raw = item.get(b"RFC822", b"")
-        body_text, body_html, atts = parse_body(raw)
-        hdrs = parse_headers(raw)
-
-        obj: Dict = {
-            "type": "message_content",
-            "mailbox": mailbox,
-            "uid": uid,
-            **env,
-            "internal_date": parse_date(internal_date_raw) if internal_date_raw else "",
-            "size": item.get(b"RFC822.SIZE", 0),
-            "flags": flags_to_list(item.get(b"FLAGS", [])),
-            "headers": hdrs,
-            "body_text": body_text,
-            "body_html": body_html,
-            "attachments": [] if no_attachments else atts,
-        }
+    obj: Dict = {
+        "type": "message_content",
+        "mailbox": mailbox,
+        "uid": uid,
+        **env,
+        "internal_date": parse_date(internal_date_raw) if internal_date_raw else "",
+        "size": item.get(b"RFC822.SIZE", 0),
+        "flags": flags_to_list(item.get(b"FLAGS", [])),
+        "headers": hdrs,
+        "body_text": body_text,
+        "body_html": body_html,
+        "attachments": [] if no_attachments else atts,
+    }
 
     if cache:
         cache.set_message_content(mailbox, uid, obj)
@@ -587,12 +718,259 @@ def emit(obj: Dict):
         sys.stdout.flush()
 
 
-def emit_err(msg: str, **kw):
-    with _output_lock:
-        sys.stderr.write(
-            json.dumps({"type": "error", "message": msg, **kw}, ensure_ascii=False) + "\n"
+def _imap_error_code(exc: Exception) -> str:
+    """
+    Extract the bracketed IMAP response code from an exception message.
+    e.g. 'select failed: [SERVERBUG] ...' → 'SERVERBUG'
+    Falls back to the exception class name if no code is found.
+    """
+    m = re.search(r'\[([A-Z][A-Z0-9\-]+)\]', str(exc))
+    return m.group(1) if m else type(exc).__name__
+
+
+class Progress:
+    """
+    Live progress display rendered to stderr (only when stderr is a TTY).
+
+    Thread-safe: all mutable state is protected by an internal lock.
+    Coordinates with _output_lock so error/pause lines never interleave
+    with the spinner line.
+
+    Displayed fields:
+      spinner  elapsed  requests=N  active=N  queue=N  cached=N  avg=N.NNNs/req
+
+    Cache hits are counted separately and excluded from the avg calculation
+    since they complete near-instantly and would skew the IMAP latency metric.
+    """
+
+    _SPINNERS = r'|/-\\'
+    _WIDTH = 100  # assumed max line width for blanking
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._start = time.monotonic()
+        self._requests_done: int = 0   # IMAP requests completed (cache misses)
+        self._cache_hits: int = 0      # items served from cache
+        self._active: int = 0          # items currently being processed
+        self._queue_size: int = 0      # items submitted but not yet started
+        self._total_time: float = 0.0  # wall time for IMAP requests only
+        self._errors: int = 0          # total error events emitted
+        self._failed: int = 0          # requests that exhausted all retries
+        self._paused: int = 0          # threads currently sleeping in backoff
+        self._spinner_idx: int = 0
+        self._running: bool = False
+        self._tty: bool = sys.stderr.isatty()
+        self._thread: Optional[threading.Thread] = None
+
+    # -- lifecycle -----------------------------------------------------------
+
+    def start(self) -> None:
+        if not self._tty:
+            return
+        self._running = True
+        self._thread = threading.Thread(
+            target=self._loop, daemon=True, name="progress"
         )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._running = False
+        if self._thread:
+            self._thread.join(timeout=0.5)
+        if self._tty:
+            with _output_lock:
+                sys.stderr.write("\r" + " " * self._WIDTH + "\r")
+                sys.stderr.flush()
+
+    # -- stats API (called from worker threads) ------------------------------
+
+    def add_queue(self, n: int = 1) -> None:
+        """Called when items are submitted to the thread pool."""
+        with self._lock:
+            self._queue_size += n
+
+    def start_call(self) -> None:
+        """Called at the start of each worker: moves one item queue→active."""
+        with self._lock:
+            self._queue_size = max(0, self._queue_size - 1)
+            self._active += 1
+
+    def finish_call(self, elapsed: float, *, cached: bool) -> None:
+        """
+        Called at the end of each worker.
+        cached=True  → increments cache_hits; elapsed excluded from avg.
+        cached=False → increments requests_done; elapsed included in avg.
+        """
+        with self._lock:
+            self._active = max(0, self._active - 1)
+            if cached:
+                self._cache_hits += 1
+            else:
+                self._requests_done += 1
+                self._total_time += elapsed
+
+    def record_error(self, *, failed: bool = False) -> None:
+        """
+        Called by emit_err.
+        failed=True  → the request exhausted all retries (counted in _failed).
+        Every call increments _errors regardless.
+        """
+        with self._lock:
+            self._errors += 1
+            if failed:
+                self._failed += 1
+
+    def start_pause(self) -> None:
+        """Called just before a backoff sleep: moves one item active→paused."""
+        with self._lock:
+            self._active = max(0, self._active - 1)
+            self._paused += 1
+
+    def end_pause(self) -> None:
+        """Called just after a backoff sleep: moves one item paused→active."""
+        with self._lock:
+            self._paused = max(0, self._paused - 1)
+            self._active += 1
+
+    # -- line management (called inside _output_lock) -----------------------
+
+    def clear_line(self) -> None:
+        """Blank the progress line. MUST be called while _output_lock is held."""
+        if self._tty and self._running:
+            sys.stderr.write("\r" + " " * self._WIDTH + "\r")
+
+    # -- internal ------------------------------------------------------------
+
+    def _loop(self) -> None:
+        while self._running:
+            self._render()
+            time.sleep(0.1)
+
+    def _render(self) -> None:
+        with self._lock:
+            elapsed = time.monotonic() - self._start
+            done = self._requests_done
+            cached = self._cache_hits
+            active = self._active
+            paused = self._paused
+            queue = self._queue_size
+            total = self._total_time
+            errors = self._errors
+            failed = self._failed
+            ch = self._SPINNERS[self._spinner_idx % len(self._SPINNERS)]
+            self._spinner_idx += 1
+
+        avg = total / done if done else 0.0
+
+        h = int(elapsed // 3600)
+        m = int((elapsed % 3600) // 60)
+        s = elapsed % 60
+        if h:
+            elapsed_str = f"{h}h{m:02d}m{s:04.1f}s"
+        elif m:
+            elapsed_str = f"{m}m{s:04.1f}s"
+        else:
+            elapsed_str = f"{s:.1f}s"
+
+        line = (
+            f"\r{ch} {elapsed_str}"
+            f"  requests={done}"
+            f"  active={active}"
+        )
+        if paused:
+            line += f"  paused={paused}"
+        line += (
+            f"  queue={queue}"
+            f"  cached={cached}"
+            f"  avg={avg:.3f}s/req"
+        )
+        # Show error summary only when there are errors (avoids clutter on clean runs)
+        if errors:
+            line += f"  errors={errors}"
+            if failed:
+                line += f"  failed={failed}"
+        # Pad to overwrite any longer previous line, keep cursor on same line
+        pad = max(0, self._WIDTH - len(line) - 1)
+        with _output_lock:
+            sys.stderr.write(line + " " * pad)
+            sys.stderr.flush()
+
+
+# Module-level progress instance; set by main() when --progress is active.
+_progress: Optional[Progress] = None
+
+
+def emit_err(
+    message: str,
+    *,
+    api: str = "",
+    mailbox: str = "",
+    uid: Optional[int] = None,
+    message_id: str = "",
+    error_code: str = "",
+    failed: bool = False,
+) -> None:
+    """
+    Write a structured error record to stderr as JSON Lines.
+    failed=True signals that all retries were exhausted (counted separately
+    in the progress display from transient/single errors).
+    """
+    record: Dict[str, Any] = {
+        "type": "error",
+        "timestamp": now_iso(),
+        "pid": _PID,
+        "thread": threading.current_thread().name,
+        "api": api,
+        "message": message,
+        "error_code": error_code,
+    }
+    if mailbox:
+        record["mailbox"] = mailbox
+    if uid is not None:
+        record["uid"] = uid
+    if message_id:
+        record["message_id"] = message_id
+    if failed:
+        record["failed"] = True
+    with _output_lock:
+        if _progress:
+            _progress.clear_line()
+            _progress.record_error(failed=failed)
+        sys.stderr.write(json.dumps(record, ensure_ascii=False) + "\n")
         sys.stderr.flush()
+
+
+def emit_pause(
+    delay: float,
+    *,
+    api: str = "",
+    mailbox: str = "",
+    uid: Optional[int] = None,
+    attempt: int = 0,
+    error: str = "",
+) -> None:
+    """Write a backoff-pause record to stderr as JSON Lines, then sleep."""
+    record: Dict[str, Any] = {
+        "type": "pause",
+        "timestamp": now_iso(),
+        "pid": _PID,
+        "thread": threading.current_thread().name,
+        "api": api,
+        "delay_seconds": round(delay, 3),
+        "attempt": attempt,
+    }
+    if error:
+        record["error"] = error
+    if mailbox:
+        record["mailbox"] = mailbox
+    if uid is not None:
+        record["uid"] = uid
+    with _output_lock:
+        if _progress:
+            _progress.clear_line()
+        sys.stderr.write(json.dumps(record, ensure_ascii=False) + "\n")
+        sys.stderr.flush()
+    time.sleep(delay)
 
 
 # ---------------------------------------------------------------------------
@@ -600,8 +978,19 @@ def emit_err(msg: str, **kw):
 # ---------------------------------------------------------------------------
 
 def cmd_mailboxes(args, pool: ConnectionPool, cache: Optional[Cache]):
-    for mb in op_mailboxes(pool, cache, args.no_cache):
-        emit(mb)
+    if _progress:
+        _progress.add_queue(1)
+        _progress.start_call()
+    t0 = time.monotonic()
+    try:
+        for mb in op_mailboxes(pool, cache, args.no_cache):
+            emit(mb)
+    finally:
+        if _progress:
+            _progress.finish_call(
+                time.monotonic() - t0,
+                cached=getattr(_call_cached, "value", False),
+            )
 
 
 def cmd_messages(args, pool: ConnectionPool, cache: Optional[Cache]):
@@ -610,10 +999,20 @@ def cmd_messages(args, pool: ConnectionPool, cache: Optional[Cache]):
     before = getattr(args, "before", None)
 
     def process(mailbox: str):
-        for msg in op_messages(pool, mailbox, cache,
-                               no_cache=args.no_cache,
-                               limit=limit, since=since, before=before):
-            emit(msg)
+        if _progress:
+            _progress.start_call()
+        t0 = time.monotonic()
+        try:
+            for msg in op_messages(pool, mailbox, cache,
+                                   no_cache=args.no_cache,
+                                   limit=limit, since=since, before=before):
+                emit(msg)
+        finally:
+            if _progress:
+                _progress.finish_call(
+                    time.monotonic() - t0,
+                    cached=getattr(_call_cached, "value", False),
+                )
 
     if not sys.stdin.isatty():
         with ThreadPoolExecutor(max_workers=args.pool_size) as ex:
@@ -627,6 +1026,8 @@ def cmd_messages(args, pool: ConnectionPool, cache: Optional[Cache]):
                 except json.JSONDecodeError:
                     continue
                 if obj.get("type") == "mailbox" and obj.get("name"):
+                    if _progress:
+                        _progress.add_queue(1)
                     futs.append(ex.submit(process, obj["name"]))
             for f in as_completed(futs):
                 try:
@@ -634,6 +1035,8 @@ def cmd_messages(args, pool: ConnectionPool, cache: Optional[Cache]):
                 except Exception as exc:
                     emit_err(str(exc))
     elif getattr(args, "mailbox", None):
+        if _progress:
+            _progress.add_queue(1)
         process(args.mailbox)
     else:
         emit_err("Provide --mailbox or pipe mailbox JSON Lines from stdin.")
@@ -643,10 +1046,20 @@ def cmd_fetch(args, pool: ConnectionPool, cache: Optional[Cache]):
     no_att = getattr(args, "no_attachments", False)
 
     def process(mailbox: str, uid: int):
-        obj = op_fetch(pool, mailbox, uid, cache,
-                       no_cache=args.no_cache, no_attachments=no_att)
-        if obj:
-            emit(obj)
+        if _progress:
+            _progress.start_call()
+        t0 = time.monotonic()
+        try:
+            obj = op_fetch(pool, mailbox, uid, cache,
+                           no_cache=args.no_cache, no_attachments=no_att)
+            if obj:
+                emit(obj)
+        finally:
+            if _progress:
+                _progress.finish_call(
+                    time.monotonic() - t0,
+                    cached=getattr(_call_cached, "value", False),
+                )
 
     if not sys.stdin.isatty():
         with ThreadPoolExecutor(max_workers=args.pool_size) as ex:
@@ -660,6 +1073,8 @@ def cmd_fetch(args, pool: ConnectionPool, cache: Optional[Cache]):
                 except json.JSONDecodeError:
                     continue
                 if obj.get("type") == "message" and obj.get("mailbox") and obj.get("uid"):
+                    if _progress:
+                        _progress.add_queue(1)
                     futs.append(ex.submit(process, obj["mailbox"], int(obj["uid"])))
             for f in as_completed(futs):
                 try:
@@ -667,6 +1082,8 @@ def cmd_fetch(args, pool: ConnectionPool, cache: Optional[Cache]):
                 except Exception as exc:
                     emit_err(str(exc))
     elif getattr(args, "mailbox", None) and getattr(args, "uid", None) is not None:
+        if _progress:
+            _progress.add_queue(1)
         process(args.mailbox, int(args.uid))
     else:
         emit_err("Provide --mailbox + --uid or pipe message JSON Lines from stdin.")
@@ -695,7 +1112,7 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--no-ssl", action="store_true", help="Disable TLS")
     g.add_argument("--pool-size", type=int, default=5, metavar="N")
     g.add_argument("--throttle-delay", type=float, default=0.0, metavar="SEC")
-    g.add_argument("--max-retries", type=int, default=3)
+    g.add_argument("--max-retries", type=int, default=5)
 
     c = p.add_argument_group("cache")
     c.add_argument("--cache-dir", default=os.path.expanduser("~/.imap-cache"))
@@ -704,6 +1121,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Wipe cache before running")
 
     p.add_argument("--verbose", "-v", action="store_true")
+    p.add_argument("--progress", "-p", action="store_true",
+                   help="Show live progress (spinner, elapsed, requests, queue, avg/req) on stderr")
 
     sub = p.add_subparsers(dest="command", required=True)
 
@@ -765,6 +1184,11 @@ def main():
         max_retries=args.max_retries,
     )
 
+    global _progress
+    if getattr(args, "progress", False):
+        _progress = Progress()
+        _progress.start()
+
     try:
         dispatch = {
             "mailboxes": cmd_mailboxes,
@@ -775,6 +1199,8 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        if _progress:
+            _progress.stop()
         pool.close()
 
 
