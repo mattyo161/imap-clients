@@ -607,6 +607,117 @@ def _imap_error_code(exc: Exception) -> str:
     return m.group(1) if m else type(exc).__name__
 
 
+class Progress:
+    """
+    Live progress display rendered to stderr (only when stderr is a TTY).
+
+    Thread-safe: all mutable state is protected by an internal lock.
+    Coordinates with _output_lock so error/pause lines never interleave
+    with the spinner line.
+
+    Displayed fields:
+      spinner  elapsed  requests=N  queue=N  avg=N.NNNs/req
+    """
+
+    _SPINNERS = r'|/-\\'
+    _WIDTH = 80  # assumed max line width for blanking
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._start = time.monotonic()
+        self._requests_done: int = 0
+        self._queue_size: int = 0
+        self._total_time: float = 0.0
+        self._spinner_idx: int = 0
+        self._running: bool = False
+        self._tty: bool = sys.stderr.isatty()
+        self._thread: Optional[threading.Thread] = None
+
+    # -- lifecycle -----------------------------------------------------------
+
+    def start(self) -> None:
+        if not self._tty:
+            return
+        self._running = True
+        self._thread = threading.Thread(
+            target=self._loop, daemon=True, name="progress"
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._running = False
+        if self._thread:
+            self._thread.join(timeout=0.5)
+        if self._tty:
+            with _output_lock:
+                sys.stderr.write("\r" + " " * self._WIDTH + "\r")
+                sys.stderr.flush()
+
+    # -- stats API (called from worker threads) ------------------------------
+
+    def add_queue(self, n: int = 1) -> None:
+        with self._lock:
+            self._queue_size += n
+
+    def record_call(self, elapsed: float) -> None:
+        """Mark one item complete; decrements queue and accumulates timing."""
+        with self._lock:
+            self._requests_done += 1
+            self._queue_size = max(0, self._queue_size - 1)
+            self._total_time += elapsed
+
+    # -- line management (called inside _output_lock) -----------------------
+
+    def clear_line(self) -> None:
+        """Blank the progress line. MUST be called while _output_lock is held."""
+        if self._tty and self._running:
+            sys.stderr.write("\r" + " " * self._WIDTH + "\r")
+
+    # -- internal ------------------------------------------------------------
+
+    def _loop(self) -> None:
+        while self._running:
+            self._render()
+            time.sleep(0.1)
+
+    def _render(self) -> None:
+        with self._lock:
+            elapsed = time.monotonic() - self._start
+            done = self._requests_done
+            queue = self._queue_size
+            total = self._total_time
+            ch = self._SPINNERS[self._spinner_idx % len(self._SPINNERS)]
+            self._spinner_idx += 1
+
+        avg = total / done if done else 0.0
+
+        h = int(elapsed // 3600)
+        m = int((elapsed % 3600) // 60)
+        s = elapsed % 60
+        if h:
+            elapsed_str = f"{h}h{m:02d}m{s:04.1f}s"
+        elif m:
+            elapsed_str = f"{m}m{s:04.1f}s"
+        else:
+            elapsed_str = f"{s:.1f}s"
+
+        line = (
+            f"\r{ch} {elapsed_str}"
+            f"  requests={done}"
+            f"  queue={queue}"
+            f"  avg={avg:.3f}s/req"
+        )
+        # Pad to overwrite any longer previous line, keep cursor on same line
+        pad = max(0, self._WIDTH - len(line) - 1)
+        with _output_lock:
+            sys.stderr.write(line + " " * pad)
+            sys.stderr.flush()
+
+
+# Module-level progress instance; set by main() when --progress is active.
+_progress: Optional[Progress] = None
+
+
 def emit_err(
     message: str,
     *,
@@ -632,6 +743,8 @@ def emit_err(
     if message_id:
         record["message_id"] = message_id
     with _output_lock:
+        if _progress:
+            _progress.clear_line()
         sys.stderr.write(json.dumps(record, ensure_ascii=False) + "\n")
         sys.stderr.flush()
 
@@ -658,6 +771,8 @@ def emit_pause(
     if uid is not None:
         record["uid"] = uid
     with _output_lock:
+        if _progress:
+            _progress.clear_line()
         sys.stderr.write(json.dumps(record, ensure_ascii=False) + "\n")
         sys.stderr.flush()
     time.sleep(delay)
@@ -668,8 +783,15 @@ def emit_pause(
 # ---------------------------------------------------------------------------
 
 def cmd_mailboxes(args, pool: ConnectionPool, cache: Optional[Cache]):
-    for mb in op_mailboxes(pool, cache, args.no_cache):
-        emit(mb)
+    if _progress:
+        _progress.add_queue(1)
+    t0 = time.monotonic()
+    try:
+        for mb in op_mailboxes(pool, cache, args.no_cache):
+            emit(mb)
+    finally:
+        if _progress:
+            _progress.record_call(time.monotonic() - t0)
 
 
 def cmd_messages(args, pool: ConnectionPool, cache: Optional[Cache]):
@@ -678,10 +800,15 @@ def cmd_messages(args, pool: ConnectionPool, cache: Optional[Cache]):
     before = getattr(args, "before", None)
 
     def process(mailbox: str):
-        for msg in op_messages(pool, mailbox, cache,
-                               no_cache=args.no_cache,
-                               limit=limit, since=since, before=before):
-            emit(msg)
+        t0 = time.monotonic()
+        try:
+            for msg in op_messages(pool, mailbox, cache,
+                                   no_cache=args.no_cache,
+                                   limit=limit, since=since, before=before):
+                emit(msg)
+        finally:
+            if _progress:
+                _progress.record_call(time.monotonic() - t0)
 
     if not sys.stdin.isatty():
         with ThreadPoolExecutor(max_workers=args.pool_size) as ex:
@@ -695,6 +822,8 @@ def cmd_messages(args, pool: ConnectionPool, cache: Optional[Cache]):
                 except json.JSONDecodeError:
                     continue
                 if obj.get("type") == "mailbox" and obj.get("name"):
+                    if _progress:
+                        _progress.add_queue(1)
                     futs.append(ex.submit(process, obj["name"]))
             for f in as_completed(futs):
                 try:
@@ -702,6 +831,8 @@ def cmd_messages(args, pool: ConnectionPool, cache: Optional[Cache]):
                 except Exception as exc:
                     emit_err(str(exc))
     elif getattr(args, "mailbox", None):
+        if _progress:
+            _progress.add_queue(1)
         process(args.mailbox)
     else:
         emit_err("Provide --mailbox or pipe mailbox JSON Lines from stdin.")
@@ -711,10 +842,15 @@ def cmd_fetch(args, pool: ConnectionPool, cache: Optional[Cache]):
     no_att = getattr(args, "no_attachments", False)
 
     def process(mailbox: str, uid: int):
-        obj = op_fetch(pool, mailbox, uid, cache,
-                       no_cache=args.no_cache, no_attachments=no_att)
-        if obj:
-            emit(obj)
+        t0 = time.monotonic()
+        try:
+            obj = op_fetch(pool, mailbox, uid, cache,
+                           no_cache=args.no_cache, no_attachments=no_att)
+            if obj:
+                emit(obj)
+        finally:
+            if _progress:
+                _progress.record_call(time.monotonic() - t0)
 
     if not sys.stdin.isatty():
         with ThreadPoolExecutor(max_workers=args.pool_size) as ex:
@@ -728,6 +864,8 @@ def cmd_fetch(args, pool: ConnectionPool, cache: Optional[Cache]):
                 except json.JSONDecodeError:
                     continue
                 if obj.get("type") == "message" and obj.get("mailbox") and obj.get("uid"):
+                    if _progress:
+                        _progress.add_queue(1)
                     futs.append(ex.submit(process, obj["mailbox"], int(obj["uid"])))
             for f in as_completed(futs):
                 try:
@@ -735,6 +873,8 @@ def cmd_fetch(args, pool: ConnectionPool, cache: Optional[Cache]):
                 except Exception as exc:
                     emit_err(str(exc))
     elif getattr(args, "mailbox", None) and getattr(args, "uid", None) is not None:
+        if _progress:
+            _progress.add_queue(1)
         process(args.mailbox, int(args.uid))
     else:
         emit_err("Provide --mailbox + --uid or pipe message JSON Lines from stdin.")
@@ -772,6 +912,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Wipe cache before running")
 
     p.add_argument("--verbose", "-v", action="store_true")
+    p.add_argument("--progress", "-p", action="store_true",
+                   help="Show live progress (spinner, elapsed, requests, queue, avg/req) on stderr")
 
     sub = p.add_subparsers(dest="command", required=True)
 
@@ -833,6 +975,11 @@ def main():
         max_retries=args.max_retries,
     )
 
+    global _progress
+    if getattr(args, "progress", False):
+        _progress = Progress()
+        _progress.start()
+
     try:
         dispatch = {
             "mailboxes": cmd_mailboxes,
@@ -843,6 +990,8 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        if _progress:
+            _progress.stop()
         pool.close()
 
 
