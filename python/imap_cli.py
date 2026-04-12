@@ -313,12 +313,46 @@ class Cache:
 # Connection pool
 # ---------------------------------------------------------------------------
 
+class _ResizableSemaphore:
+    """
+    A semaphore whose upper limit can be changed at runtime.
+    Used to dynamically reduce active IMAP connections when the server
+    signals throttling, then restore once requests succeed again.
+    """
+
+    def __init__(self, limit: int) -> None:
+        self._limit = limit
+        self._count = 0
+        self._cond = threading.Condition(threading.Lock())
+
+    def acquire(self) -> None:
+        with self._cond:
+            while self._count >= self._limit:
+                self._cond.wait(timeout=0.5)  # re-check periodically
+            self._count += 1
+
+    def release(self) -> None:
+        with self._cond:
+            self._count -= 1
+            self._cond.notify_all()
+
+    def set_limit(self, new_limit: int) -> None:
+        with self._cond:
+            self._limit = max(1, new_limit)
+            self._cond.notify_all()
+
+    @property
+    def limit(self) -> int:
+        with self._cond:
+            return self._limit
+
+
 class ConnectionPool:
     """Thread-safe pool of authenticated IMAPClient connections."""
 
     def __init__(self, host: str, port: int, user: str, password: str,
                  ssl: bool, pool_size: int = 5,
-                 throttle_delay: float = 0.0, max_retries: int = 3):
+                 throttle_delay: float = 0.0, max_retries: int = 5):
         self.host = host
         self.port = port
         self.user = user
@@ -328,7 +362,42 @@ class ConnectionPool:
         self.throttle_delay = throttle_delay
         self.max_retries = max_retries
         self._pool: queue.Queue = queue.Queue(maxsize=pool_size)
-        self._sem = threading.Semaphore(pool_size)
+        self._sem = _ResizableSemaphore(pool_size)
+        self._throttle_lock = threading.Lock()
+        self._throttle_events: int = 0  # count of in-flight throttle recoveries
+
+    # -- throttle management -------------------------------------------------
+
+    def on_throttle(self) -> None:
+        """
+        Called when any IMAP operation receives a server error.
+        Reduces active concurrency to 1 so that retries don't hammer the
+        server with the same number of parallel connections that got us
+        throttled in the first place.
+        """
+        with self._throttle_lock:
+            self._throttle_events += 1
+            self._sem.set_limit(1)
+            log.debug(
+                "throttle detected — reducing pool concurrency to 1 "
+                "(throttle_events=%d)", self._throttle_events
+            )
+
+    def on_success(self) -> None:
+        """
+        Called after a successful IMAP operation.
+        Decrements the throttle event counter and restores full concurrency
+        once all in-flight recoveries have completed.
+        """
+        with self._throttle_lock:
+            if self._throttle_events > 0:
+                self._throttle_events -= 1
+            if self._throttle_events == 0 and self._sem.limit < self.pool_size:
+                self._sem.set_limit(self.pool_size)
+                log.debug("throttle cleared — restoring pool concurrency to %d",
+                          self.pool_size)
+
+    # -- connection lifecycle ------------------------------------------------
 
     def _new_conn(self) -> IMAPClient:
         for attempt in range(self.max_retries):
@@ -342,10 +411,9 @@ class ConnectionPool:
             except Exception as exc:
                 if attempt >= self.max_retries - 1:
                     raise
-                delay = (2 ** attempt) * max(0.5, self.throttle_delay)
-                emit_err(str(exc), api="connect",
-                         error_code=_imap_error_code(exc))
-                emit_pause(delay, api="connect", attempt=attempt + 1)
+                delay = 5 * (2 ** attempt)
+                emit_pause(delay, api="connect", attempt=attempt + 1,
+                           error=str(exc))
         raise RuntimeError("unreachable")
 
     @contextlib.contextmanager
@@ -506,13 +574,16 @@ def op_messages(pool: ConnectionPool, mailbox: str,
                             "size": item.get(b"RFC822.SIZE", 0),
                             "flags": flags_to_list(item.get(b"FLAGS", [])),
                         })
+            pool.on_success()
             break  # success — exit retry loop
         except Exception as exc:
             last_exc = exc
             results = []
+            pool.on_throttle()
             if attempt < pool.max_retries - 1:
-                emit_pause(2 ** attempt, api="messages",
-                           mailbox=mailbox, attempt=attempt + 1)
+                emit_pause(5 * (2 ** attempt), api="messages",
+                           mailbox=mailbox, attempt=attempt + 1,
+                           error=str(exc))
     else:
         # All attempts exhausted
         emit_err(str(last_exc), api="messages", mailbox=mailbox,
@@ -549,13 +620,15 @@ def op_fetch(pool: ConnectionPool, mailbox: str, uid: int,
                     [uid],
                     ["ENVELOPE", "FLAGS", "RFC822.SIZE", "INTERNALDATE", "RFC822"],
                 )
+            pool.on_success()
             break  # success — exit retry loop
         except Exception as exc:
             last_exc = exc
             data = None
+            pool.on_throttle()
             if attempt < pool.max_retries - 1:
-                emit_pause(2 ** attempt, api="fetch", mailbox=mailbox,
-                           uid=uid, attempt=attempt + 1)
+                emit_pause(5 * (2 ** attempt), api="fetch", mailbox=mailbox,
+                           uid=uid, attempt=attempt + 1, error=str(exc))
     else:
         # All attempts exhausted
         emit_err(str(last_exc), api="fetch", mailbox=mailbox, uid=uid,
@@ -814,6 +887,7 @@ def emit_pause(
     mailbox: str = "",
     uid: Optional[int] = None,
     attempt: int = 0,
+    error: str = "",
 ) -> None:
     """Write a backoff-pause record to stderr as JSON Lines, then sleep."""
     record: Dict[str, Any] = {
@@ -824,6 +898,8 @@ def emit_pause(
         "delay_seconds": round(delay, 3),
         "attempt": attempt,
     }
+    if error:
+        record["error"] = error
     if mailbox:
         record["mailbox"] = mailbox
     if uid is not None:
@@ -975,7 +1051,7 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--no-ssl", action="store_true", help="Disable TLS")
     g.add_argument("--pool-size", type=int, default=5, metavar="N")
     g.add_argument("--throttle-delay", type=float, default=0.0, metavar="SEC")
-    g.add_argument("--max-retries", type=int, default=3)
+    g.add_argument("--max-retries", type=int, default=5)
 
     c = p.add_argument_group("cache")
     c.add_argument("--cache-dir", default=os.path.expanduser("~/.imap-cache"))
