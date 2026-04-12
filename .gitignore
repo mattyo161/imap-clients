@@ -32,3 +32,11 @@ target/
 *.swo
 .idea/
 .vscode/
+
+# Ignore working jsonl and log files
+*.jsonl
+*.jsonl.gz
+*.log
+
+# Ingore env files
+*.env
