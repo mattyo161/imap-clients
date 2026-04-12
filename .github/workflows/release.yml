@@ -2,8 +2,7 @@ name: Release
 
 on:
   push:
-    branches:
-      - main
+    branches: [main]
 
 # Only one release job at a time — prevents races when commits land quickly.
 concurrency:
@@ -11,27 +10,26 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  contents: write        # push version-bump commit + create release/tag
+  contents: write        # create tag + GitHub release
   issues: write          # comment on issues referenced in commits
   pull-requests: write   # comment on PRs referenced in commits
   id-token: write        # OIDC (future PyPI trusted publishing)
 
 jobs:
   release:
-    name: Semantic Release
+    name: Tag and publish release
     runs-on: ubuntu-latest
 
     steps:
-      # full history is required so semantic-release can walk commits
+      # Full history is required so semantic-release can walk commits.
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          # Use a PAT when available so the version-bump commit can bypass
-          # branch protection rules that block the default GITHUB_TOKEN.
-          # Add a repo secret named RELEASE_TOKEN (classic PAT, repo scope)
-          # to enable this. Falls back to GITHUB_TOKEN if the secret is absent.
           token: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Fetch all tags
+        run: git fetch --tags --force
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -41,12 +39,27 @@ jobs:
       - name: Install python-semantic-release
         run: pip install python-semantic-release
 
-      - name: Run semantic-release
-        uses: python-semantic-release/python-semantic-release@v9
-        with:
-          github_token: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
-          git_committer_name: "github-actions[bot]"
-          git_committer_email: "github-actions[bot]@users.noreply.github.com"
+      - name: Configure git identity
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Tag and publish release
+        # The version bump and CHANGELOG were already committed to the PR branch
+        # before merge (by version-bump.yml), so:
+        #
+        #   --no-commit    : version files are already correct; skip the commit
+        #   --no-changelog : CHANGELOG was already written in the PR
+        #
+        # semantic-release will detect that the files haven't changed, tag the
+        # merge commit, push the tag, and create the GitHub release — no extra
+        # commit lands on main.
+        run: |
+          semantic-release version \
+            --no-commit \
+            --no-changelog
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
 
       # -----------------------------------------------------------------------
       # Optional: upload build artefacts to the release

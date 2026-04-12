@@ -57,18 +57,22 @@ feat!: remove deprecated --verbose flag
 
 ## Versioning
 
-Versions are managed automatically by **python-semantic-release** on every push to `main`:
+Versions are managed automatically by **python-semantic-release** using a two-stage approach that avoids any post-merge commit on `main`:
 
-- Commits since the last tag are analysed
-- Version in `pyproject.toml` and `python/imap_cli.py` is bumped accordingly
-- A GitHub Release + CHANGELOG entry is generated
+| Stage | Workflow | What happens |
+|-------|----------|--------------|
+| PR open / update | `version-bump.yml` | Calculates next version, updates `pyproject.toml` + `python/imap_cli.py` + `CHANGELOG.md`, commits back to the PR branch |
+| Push to `main` | `release.yml` | Detects version files are already correct (no diff), **tags the merge commit**, creates GitHub Release — no new commit |
+
 - Tag format: `v<major>.<minor>.<patch>`
+- PRs with only `chore`/`docs`/`style`/`test`/`ci` commits produce no bump; the version-bump workflow is a no-op
 
-Do **not** manually edit the version strings — let the release workflow handle it.
+Do **not** manually edit the version strings — let the workflows handle it.
 
 ## PR Workflow
 
 1. Run `/new-feat` or `/new-fix` — Claude creates the branch and opens the PR
 2. Commit using conventional format above
-3. Claude updates the PR description after each push to reflect cumulative changes
-4. Merge via GitHub UI (squash or merge commit — do not rebase)
+3. `version-bump.yml` automatically commits the version bump + CHANGELOG to your branch
+4. Claude updates the PR description after each push to reflect cumulative changes
+5. Merge via GitHub UI (squash or merge commit — do not rebase)
