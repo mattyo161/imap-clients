@@ -39,7 +39,8 @@ _PID = os.getpid()
 _call_cached = threading.local()    # per-thread flag: cache hit signal from op_*
 _current_conn_id = threading.local()  # per-thread: ID of the connection currently in use
 _shutdown = threading.Event()         # set on Ctrl-C; workers check this to exit early
-FETCH_BATCH = 200  # UIDs per FETCH command
+FETCH_BATCH = 200    # UIDs per FETCH command
+SEARCH_PAGE = 50_000  # UIDs per SEARCH UID range (~350KB max response)
 _PROGRESS_DIR = "/tmp/.imap_cli_progress"  # coordination files for multi-process progress
 
 
@@ -392,6 +393,8 @@ class ConnectionPool:
         self.pool_size = pool_size
         self.throttle_delay = throttle_delay
         self.max_retries = max_retries
+        self._additional_fetch_properties = []
+        self._capabilities = []
         self._pool: queue.Queue = queue.Queue(maxsize=pool_size)
         self._sem = _ResizableSemaphore(pool_size)
         self._throttle_lock = threading.Lock()
@@ -459,6 +462,10 @@ class ConnectionPool:
                     self._conn_id_counter += 1
                     conn_id = self._conn_id_counter
                 c._imap_cli_conn_id = conn_id  # type: ignore[attr-defined]
+                c._capabilities = c.capabilities()
+                if b"X-GM-EXT-1" in c._capabilities:
+                    log.debug(f"Adding additional fetch properties: X-GM-LABELS, X-GM-MSGID, X-GM-THRID")
+                    c._additional_fetch_properties = [b"X-GM-LABELS", b"X-GM-MSGID", b"X-GM-THRID"]
                 return c
             except Exception as exc:
                 if attempt >= self.max_retries - 1:
@@ -604,51 +611,42 @@ def op_messages(pool: ConnectionPool, mailbox: str,
             return
     _call_cached.value = False
 
-    criteria: List[Any] = []
+    date_criteria: List[Any] = []
     if since:
-        criteria += ["SINCE", _to_imap_date(since)]
+        date_criteria += ["SINCE", _to_imap_date(since)]
     if before:
-        criteria += ["BEFORE", _to_imap_date(before)]
-    if not criteria:
-        criteria = ["ALL"]
+        date_criteria += ["BEFORE", _to_imap_date(before)]
 
-    results: List[Dict] = []
+    # --- Phase 1: collect all matching UIDs via paginated SEARCH UID ranges ---
+    # Each page issues a bounded SEARCH so the response never exceeds ~350KB,
+    # avoiding imaplib's line-length limit on large mailboxes.
+
+    uid_next: int = 1  # will be set from SELECT response
+    all_uids: List[int] = []
     last_exc: Optional[Exception] = None
 
     for attempt in range(pool.max_retries):
         try:
-            results = []
+            all_uids = []
             with pool.acquire() as conn:
-                # select_folder, search, and all batch fetches are inside a
-                # single pool.acquire() so that any IMAP error causes the
-                # connection to be discarded and a fresh one opened on retry.
-                conn.select_folder(mailbox, readonly=True)
-                uids: List[int] = conn.search(criteria)
-                if limit:
-                    uids = uids[-limit:]
-                for i in range(0, len(uids), FETCH_BATCH):
-                    batch = uids[i: i + FETCH_BATCH]
-                    data = conn.fetch(batch, ["ENVELOPE", "FLAGS", "RFC822.SIZE", "INTERNALDATE"])
-                    for uid, item in data.items():
-                        env_raw = item.get(b"ENVELOPE")
-                        if env_raw is None:
-                            continue
-                        env = parse_envelope(env_raw)
-                        internal_date_raw = item.get(b"INTERNALDATE")
-                        results.append({
-                            "type": "message",
-                            "mailbox": mailbox,
-                            "uid": uid,
-                            **env,
-                            "internal_date": parse_date(internal_date_raw) if internal_date_raw else "",
-                            "size": item.get(b"RFC822.SIZE", 0),
-                            "flags": flags_to_list(item.get(b"FLAGS", [])),
-                        })
+                status = conn.select_folder(mailbox, readonly=True)
+                uid_next = int(status.get(b"UIDNEXT", 1))
+                for start in range(1, uid_next, SEARCH_PAGE):
+                    end = start + SEARCH_PAGE - 1
+                    # Combine UID range with any date filters; no "ALL" needed
+                    # because the UID range already restricts the result set.
+                    page_criteria: List[Any] = ["UID", f"{start}:{end}"]
+                    if date_criteria:
+                        page_criteria += date_criteria
+                    page_uids = conn.search(page_criteria)
+                    log.debug("search page uid %d:%d → %d hits in %s",
+                              start, end, len(page_uids), mailbox)
+                    all_uids.extend(page_uids)
             pool.on_success()
-            break  # success — exit retry loop
+            break
         except Exception as exc:
             last_exc = exc
-            results = []
+            all_uids = []
             delay = 5 * (2 ** attempt)
             pool.on_throttle(delay)
             if attempt < pool.max_retries - 1:
@@ -662,14 +660,85 @@ def op_messages(pool: ConnectionPool, mailbox: str,
                     if _progress:
                         _progress.end_pause()
     else:
-        # All attempts exhausted
         emit_err(str(last_exc), api="messages", mailbox=mailbox,
                  error_code=_imap_error_code(last_exc), failed=True)
         return
 
-    if cache and results:
-        cache.set_messages(mailbox, results)
-    yield from results
+    if limit:
+        all_uids = all_uids[-limit:]
+
+    # --- Phase 2: FETCH metadata in batches, streaming each batch immediately ---
+
+    for i in range(0, len(all_uids), FETCH_BATCH):
+        batch_uids = all_uids[i: i + FETCH_BATCH]
+        batch_results: List[Dict] = []
+        last_exc = None
+
+        for attempt in range(pool.max_retries):
+            try:
+                batch_results = []
+                with pool.acquire() as conn:
+                    conn.select_folder(mailbox, readonly=True)
+                    fetch_properties = [
+                        "ENVELOPE", "FLAGS", "RFC822.SIZE", "INTERNALDATE",
+                        *conn._additional_fetch_properties,
+                    ]
+                    log.debug("fetching %d uids (batch %d/%d) from %s",
+                              len(batch_uids), i // FETCH_BATCH + 1,
+                              -(-len(all_uids) // FETCH_BATCH), mailbox)
+                    data = conn.fetch(batch_uids, fetch_properties)
+                    log.debug("fetched %d items from %s", len(data), mailbox)
+                    for uid, item in data.items():
+                        env_raw = item.get(b"ENVELOPE")
+                        if env_raw is None:
+                            continue
+                        env = parse_envelope(env_raw)
+                        internal_date_raw = item.get(b"INTERNALDATE")
+                        obj: Dict = {
+                            "type": "message",
+                            "mailbox": mailbox,
+                            "uid": uid,
+                            **env,
+                            "internal_date": parse_date(internal_date_raw) if internal_date_raw else "",
+                            "size": item.get(b"RFC822.SIZE", 0),
+                            "flags": flags_to_list(item.get(b"FLAGS", [])),
+                        }
+                        for prop in [b"X-GM-LABELS", b"X-GM-MSGID", b"X-GM-THRID"]:
+                            if prop in item:
+                                value = item.get(prop)
+                                if value is None:
+                                    continue
+                                if isinstance(value, (list, tuple)):
+                                    value = [l if isinstance(l, str) else l.decode("utf-8") for l in value]
+                                elif isinstance(value, bytes):
+                                    value = value.decode("utf-8")
+                                obj[prop.decode("utf-8")] = value
+                        batch_results.append(obj)
+                pool.on_success()
+                break
+            except Exception as exc:
+                last_exc = exc
+                batch_results = []
+                delay = 5 * (2 ** attempt)
+                pool.on_throttle(delay)
+                if attempt < pool.max_retries - 1:
+                    if _progress:
+                        _progress.start_pause()
+                    try:
+                        emit_pause(delay, api="messages",
+                                   mailbox=mailbox, attempt=attempt + 1,
+                                   error=str(exc))
+                    finally:
+                        if _progress:
+                            _progress.end_pause()
+        else:
+            emit_err(str(last_exc), api="messages", mailbox=mailbox,
+                     error_code=_imap_error_code(last_exc), failed=True)
+            return
+
+        if cache and batch_results:
+            cache.set_messages(mailbox, batch_results)
+        yield from batch_results
 
 
 def op_fetch(pool: ConnectionPool, mailbox: str, uid: int,
@@ -693,9 +762,10 @@ def op_fetch(pool: ConnectionPool, mailbox: str, uid: int,
                 # so that any IMAP error causes the connection to be discarded
                 # and a fresh one opened on the next retry attempt.
                 conn.select_folder(mailbox, readonly=True)
+                fetch_properties = ["ENVELOPE", "FLAGS", "RFC822.SIZE", "INTERNALDATE", "RFC822", *conn._additional_fetch_properties]
                 data = conn.fetch(
                     [uid],
-                    ["ENVELOPE", "FLAGS", "RFC822.SIZE", "INTERNALDATE", "RFC822"],
+                    fetch_properties,
                 )
             pool.on_success()
             break  # success — exit retry loop
@@ -745,6 +815,19 @@ def op_fetch(pool: ConnectionPool, mailbox: str, uid: int,
         "body_html": body_html,
         "attachments": [] if no_attachments else atts,
     }
+
+    # check for custom properties
+    for prop in [b"X-GM-LABELS", b"X-GM-MSGID", b"X-GM-THRID"]:
+        if prop in item:
+            value = item.get(prop)
+            if value is None:
+                continue
+            if isinstance(value, (list, tuple)):
+                value = [l if isinstance(l, str) else l.decode("utf-8") for l in value]
+            elif isinstance(value, bytes):
+                value = value.decode("utf-8")
+            # ints pass through as-is
+            obj[prop.decode("utf-8")] = value
 
     if cache:
         cache.set_message_content(mailbox, uid, obj)
