@@ -33,6 +33,7 @@ except ImportError:
 log = logging.getLogger(__name__)
 _output_lock = threading.Lock()
 _PID = os.getpid()
+_call_cached = threading.local()   # per-thread flag set by op_* to signal cache hit
 FETCH_BATCH = 200  # UIDs per FETCH command
 
 
@@ -417,8 +418,10 @@ def op_mailboxes(pool: ConnectionPool, cache: Optional[Cache],
         cached = cache.get_mailboxes()
         if cached is not None:
             log.debug("mailboxes: cache hit (%d)", len(cached))
+            _call_cached.value = True
             yield from cached
             return
+    _call_cached.value = False
 
     results: List[Dict] = []
     with pool.acquire() as conn:
@@ -457,9 +460,11 @@ def op_messages(pool: ConnectionPool, mailbox: str,
         cached = cache.get_messages(mailbox)
         if cached is not None:
             log.debug("messages: cache hit for %s (%d)", mailbox, len(cached))
+            _call_cached.value = True
             items = cached if not limit else cached[-limit:]
             yield from items
             return
+    _call_cached.value = False
 
     results: List[Dict] = []
     with pool.acquire() as conn:
@@ -467,7 +472,7 @@ def op_messages(pool: ConnectionPool, mailbox: str,
             conn.select_folder(mailbox, readonly=True)
         except Exception as exc:
             emit_err(str(exc), api="messages", mailbox=mailbox,
-                     error_code=_imap_error_code(exc))
+                     error_code=_imap_error_code(exc), failed=True)
             return
 
         criteria: List[Any] = []
@@ -499,7 +504,7 @@ def op_messages(pool: ConnectionPool, mailbox: str,
                 except Exception as exc:
                     if attempt >= pool.max_retries - 1:
                         emit_err(str(exc), api="messages", mailbox=mailbox,
-                                 error_code=_imap_error_code(exc))
+                                 error_code=_imap_error_code(exc), failed=True)
                         data = {}
                     else:
                         emit_pause(2 ** attempt, api="messages",
@@ -533,14 +538,16 @@ def op_fetch(pool: ConnectionPool, mailbox: str, uid: int,
         cached = cache.get_message_content(mailbox, uid)
         if cached is not None:
             log.debug("fetch: cache hit %s/%d", mailbox, uid)
+            _call_cached.value = True
             return cached
+    _call_cached.value = False
 
     with pool.acquire() as conn:
         try:
             conn.select_folder(mailbox, readonly=True)
         except Exception as exc:
             emit_err(str(exc), api="fetch", mailbox=mailbox, uid=uid,
-                     error_code=_imap_error_code(exc))
+                     error_code=_imap_error_code(exc), failed=True)
             return None
 
         for attempt in range(pool.max_retries):
@@ -550,7 +557,7 @@ def op_fetch(pool: ConnectionPool, mailbox: str, uid: int,
             except Exception as exc:
                 if attempt >= pool.max_retries - 1:
                     emit_err(str(exc), api="fetch", mailbox=mailbox, uid=uid,
-                             error_code=_imap_error_code(exc))
+                             error_code=_imap_error_code(exc), failed=True)
                     return None
                 emit_pause(2 ** attempt, api="fetch", mailbox=mailbox,
                            uid=uid, attempt=attempt + 1)
@@ -616,18 +623,25 @@ class Progress:
     with the spinner line.
 
     Displayed fields:
-      spinner  elapsed  requests=N  queue=N  avg=N.NNNs/req
+      spinner  elapsed  requests=N  active=N  queue=N  cached=N  avg=N.NNNs/req
+
+    Cache hits are counted separately and excluded from the avg calculation
+    since they complete near-instantly and would skew the IMAP latency metric.
     """
 
     _SPINNERS = r'|/-\\'
-    _WIDTH = 80  # assumed max line width for blanking
+    _WIDTH = 100  # assumed max line width for blanking
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._start = time.monotonic()
-        self._requests_done: int = 0
-        self._queue_size: int = 0
-        self._total_time: float = 0.0
+        self._requests_done: int = 0   # IMAP requests completed (cache misses)
+        self._cache_hits: int = 0      # items served from cache
+        self._active: int = 0          # items currently being processed
+        self._queue_size: int = 0      # items submitted but not yet started
+        self._total_time: float = 0.0  # wall time for IMAP requests only
+        self._errors: int = 0          # total error events emitted
+        self._failed: int = 0          # requests that exhausted all retries
         self._spinner_idx: int = 0
         self._running: bool = False
         self._tty: bool = sys.stderr.isatty()
@@ -656,15 +670,40 @@ class Progress:
     # -- stats API (called from worker threads) ------------------------------
 
     def add_queue(self, n: int = 1) -> None:
+        """Called when items are submitted to the thread pool."""
         with self._lock:
             self._queue_size += n
 
-    def record_call(self, elapsed: float) -> None:
-        """Mark one item complete; decrements queue and accumulates timing."""
+    def start_call(self) -> None:
+        """Called at the start of each worker: moves one item queue→active."""
         with self._lock:
-            self._requests_done += 1
             self._queue_size = max(0, self._queue_size - 1)
-            self._total_time += elapsed
+            self._active += 1
+
+    def finish_call(self, elapsed: float, *, cached: bool) -> None:
+        """
+        Called at the end of each worker.
+        cached=True  → increments cache_hits; elapsed excluded from avg.
+        cached=False → increments requests_done; elapsed included in avg.
+        """
+        with self._lock:
+            self._active = max(0, self._active - 1)
+            if cached:
+                self._cache_hits += 1
+            else:
+                self._requests_done += 1
+                self._total_time += elapsed
+
+    def record_error(self, *, failed: bool = False) -> None:
+        """
+        Called by emit_err.
+        failed=True  → the request exhausted all retries (counted in _failed).
+        Every call increments _errors regardless.
+        """
+        with self._lock:
+            self._errors += 1
+            if failed:
+                self._failed += 1
 
     # -- line management (called inside _output_lock) -----------------------
 
@@ -684,8 +723,12 @@ class Progress:
         with self._lock:
             elapsed = time.monotonic() - self._start
             done = self._requests_done
+            cached = self._cache_hits
+            active = self._active
             queue = self._queue_size
             total = self._total_time
+            errors = self._errors
+            failed = self._failed
             ch = self._SPINNERS[self._spinner_idx % len(self._SPINNERS)]
             self._spinner_idx += 1
 
@@ -704,9 +747,16 @@ class Progress:
         line = (
             f"\r{ch} {elapsed_str}"
             f"  requests={done}"
+            f"  active={active}"
             f"  queue={queue}"
+            f"  cached={cached}"
             f"  avg={avg:.3f}s/req"
         )
+        # Show error summary only when there are errors (avoids clutter on clean runs)
+        if errors:
+            line += f"  errors={errors}"
+            if failed:
+                line += f"  failed={failed}"
         # Pad to overwrite any longer previous line, keep cursor on same line
         pad = max(0, self._WIDTH - len(line) - 1)
         with _output_lock:
@@ -726,8 +776,13 @@ def emit_err(
     uid: Optional[int] = None,
     message_id: str = "",
     error_code: str = "",
+    failed: bool = False,
 ) -> None:
-    """Write a structured error record to stderr as JSON Lines."""
+    """
+    Write a structured error record to stderr as JSON Lines.
+    failed=True signals that all retries were exhausted (counted separately
+    in the progress display from transient/single errors).
+    """
     record: Dict[str, Any] = {
         "type": "error",
         "timestamp": now_iso(),
@@ -742,9 +797,12 @@ def emit_err(
         record["uid"] = uid
     if message_id:
         record["message_id"] = message_id
+    if failed:
+        record["failed"] = True
     with _output_lock:
         if _progress:
             _progress.clear_line()
+            _progress.record_error(failed=failed)
         sys.stderr.write(json.dumps(record, ensure_ascii=False) + "\n")
         sys.stderr.flush()
 
@@ -785,13 +843,17 @@ def emit_pause(
 def cmd_mailboxes(args, pool: ConnectionPool, cache: Optional[Cache]):
     if _progress:
         _progress.add_queue(1)
+        _progress.start_call()
     t0 = time.monotonic()
     try:
         for mb in op_mailboxes(pool, cache, args.no_cache):
             emit(mb)
     finally:
         if _progress:
-            _progress.record_call(time.monotonic() - t0)
+            _progress.finish_call(
+                time.monotonic() - t0,
+                cached=getattr(_call_cached, "value", False),
+            )
 
 
 def cmd_messages(args, pool: ConnectionPool, cache: Optional[Cache]):
@@ -800,6 +862,8 @@ def cmd_messages(args, pool: ConnectionPool, cache: Optional[Cache]):
     before = getattr(args, "before", None)
 
     def process(mailbox: str):
+        if _progress:
+            _progress.start_call()
         t0 = time.monotonic()
         try:
             for msg in op_messages(pool, mailbox, cache,
@@ -808,7 +872,10 @@ def cmd_messages(args, pool: ConnectionPool, cache: Optional[Cache]):
                 emit(msg)
         finally:
             if _progress:
-                _progress.record_call(time.monotonic() - t0)
+                _progress.finish_call(
+                    time.monotonic() - t0,
+                    cached=getattr(_call_cached, "value", False),
+                )
 
     if not sys.stdin.isatty():
         with ThreadPoolExecutor(max_workers=args.pool_size) as ex:
@@ -842,6 +909,8 @@ def cmd_fetch(args, pool: ConnectionPool, cache: Optional[Cache]):
     no_att = getattr(args, "no_attachments", False)
 
     def process(mailbox: str, uid: int):
+        if _progress:
+            _progress.start_call()
         t0 = time.monotonic()
         try:
             obj = op_fetch(pool, mailbox, uid, cache,
@@ -850,7 +919,10 @@ def cmd_fetch(args, pool: ConnectionPool, cache: Optional[Cache]):
                 emit(obj)
         finally:
             if _progress:
-                _progress.record_call(time.monotonic() - t0)
+                _progress.finish_call(
+                    time.monotonic() - t0,
+                    cached=getattr(_call_cached, "value", False),
+                )
 
     if not sys.stdin.isatty():
         with ThreadPoolExecutor(max_workers=args.pool_size) as ex:
