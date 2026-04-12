@@ -10,6 +10,7 @@ __version__ = "0.1.0"
 
 import argparse
 import contextlib
+import fcntl
 import email as email_lib
 import email.header
 import email.policy
@@ -39,6 +40,7 @@ _call_cached = threading.local()    # per-thread flag: cache hit signal from op_
 _current_conn_id = threading.local()  # per-thread: ID of the connection currently in use
 _shutdown = threading.Event()         # set on Ctrl-C; workers check this to exit early
 FETCH_BATCH = 200  # UIDs per FETCH command
+_PROGRESS_DIR = "/tmp/.imap_cli_progress"  # coordination files for multi-process progress
 
 
 class _JsonLogFormatter(logging.Formatter):
@@ -769,25 +771,59 @@ def _imap_error_code(exc: Exception) -> str:
     return m.group(1) if m else type(exc).__name__
 
 
+def _fmt_elapsed(seconds: float) -> str:
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = seconds % 60
+    if h:
+        return f"{h}h{m:02d}m{s:04.1f}s"
+    if m:
+        return f"{m}m{s:04.1f}s"
+    return f"{s:.1f}s"
+
+
+# Short display name for each subcommand (shown in the progress line).
+_CMD_LABEL: Dict[str, str] = {
+    "mailboxes": "mailbox",
+    "messages":  "message",
+    "fetch":     "fetch",
+}
+
+
 class Progress:
     """
-    Live progress display rendered to stderr (only when stderr is a TTY).
+    Live, multi-process-aware progress display rendered to stderr.
 
-    Thread-safe: all mutable state is protected by an internal lock.
-    Coordinates with _output_lock so error/pause lines never interleave
-    with the spinner line.
+    When stderr is a TTY and multiple imap-cli processes share the same
+    process group (i.e. a pipeline), each gets its own row that updates
+    in place.  Processes coordinate via a shared temp file keyed on the
+    process-group ID so they never overwrite each other's lines.
 
-    Displayed fields:
-      spinner  elapsed  requests=N  active=N  queue=N  cached=N  avg=N.NNNs/req
+    Example (three-stage pipeline, mid-run):
 
-    Cache hits are counted separately and excluded from the avg calculation
-    since they complete near-instantly and would skew the IMAP latency metric.
+        \\ pid(123) -- 3m19.2s  mailbox  requests=40  active=0  queue=0   cached=0  avg=0.512s/req
+        - pid(124) -- 3m19.7s  message  requests=40  active=5  queue=10  cached=0  avg=7.449s/req
+        \\ pid(125) -- 3m21.8s  fetch    requests=1941 active=5 queue=57143 cached=0 avg=0.513s/req
+
+    When a process finishes its line is frozen as COMPLETE:
+
+        COMPLETE pid(123) -- 4m19.2s  mailbox  requests=40  ...
+
+    Single-process use (no pipeline) renders a single line, same as before
+    except for the added pid(...) prefix.
+
+    Thread-safety: internal stats are protected by self._lock.
+    Cross-process writes to stderr are serialised by _output_lock (same
+    lock used by emit_err / emit_pause so progress never interleaves with
+    error JSON lines).
+    Cross-process coord-file access is serialised by an exclusive flock.
     """
 
     _SPINNERS = r'|/-\\'
-    _WIDTH = 100  # assumed max line width for blanking
 
-    def __init__(self) -> None:
+    def __init__(self, cmd_name: str) -> None:
+        self._cmd_name = cmd_name
+        self._pid = os.getpid()
         self._lock = threading.Lock()
         self._start = time.monotonic()
         self._requests_done: int = 0   # IMAP requests completed (cache misses)
@@ -802,8 +838,37 @@ class Progress:
         self._running: bool = False
         self._tty: bool = sys.stderr.isatty()
         self._thread: Optional[threading.Thread] = None
+        # Lines currently drawn on screen — kept consistent under _output_lock
+        # so that clear_line() (also called under _output_lock) always knows
+        # how many lines to erase.
+        self._screen_lines: int = 0
+        # Paths to coordination files (populated in _setup_coord)
+        self._coord_path: str = ""
+        self._lock_path: str = ""
+        self._slot: int = 0            # index in the slots list (stable identifier)
+
+        if self._tty:
+            self._setup_coord()
 
     # -- lifecycle -----------------------------------------------------------
+
+    def _setup_coord(self) -> None:
+        """Register this process in the shared coord file and claim a slot."""
+        pgid = os.getpgrp()
+        os.makedirs(_PROGRESS_DIR, exist_ok=True, mode=0o700)
+        self._coord_path = os.path.join(_PROGRESS_DIR, f"{pgid}.json")
+        self._lock_path  = os.path.join(_PROGRESS_DIR, f"{pgid}.lock")
+        with self._flock():
+            data = self._read_coord()
+            self._slot = len(data["slots"])
+            data["slots"].append({
+                "pid":  self._pid,
+                "slot": self._slot,
+                "cmd":  self._cmd_name,
+                "done": False,
+                "line": "",
+            })
+            self._write_coord(data)
 
     def start(self) -> None:
         if not self._tty:
@@ -815,13 +880,44 @@ class Progress:
         self._thread.start()
 
     def stop(self) -> None:
+        """Stop rendering and freeze this process's line as COMPLETE."""
         self._running = False
         if self._thread:
             self._thread.join(timeout=0.5)
-        if self._tty:
+        if not self._tty:
+            return
+
+        final_line = self._build_line(done=True)
+
+        # Hold coord lock while doing the final write so no other process
+        # can reposition the cursor in between.
+        with self._flock():
+            data = self._read_coord()
+            for s in data["slots"]:
+                if s["slot"] == self._slot:
+                    s["done"] = True
+                    s["line"] = final_line
+                    break
+            old_screen = data["screen_lines"]
+            n = len(data["slots"])
+            render_str = self._build_render_str(data["slots"], old_screen, n)
+            all_done = all(s["done"] for s in data["slots"])
+            data["screen_lines"] = n
+            self._write_coord(data)
+
             with _output_lock:
-                sys.stderr.write("\r" + " " * self._WIDTH + "\r")
+                sys.stderr.write(render_str)
+                if all_done:
+                    # Leave cursor on a fresh line so the shell prompt appears below.
+                    sys.stderr.write("\n")
                 sys.stderr.flush()
+                self._screen_lines = 0 if all_done else n
+
+        if all_done:
+            with contextlib.suppress(OSError):
+                os.unlink(self._coord_path)
+            with contextlib.suppress(OSError):
+                os.unlink(self._lock_path)
 
     # -- stats API (called from worker threads) ------------------------------
 
@@ -876,46 +972,90 @@ class Progress:
     # -- line management (called inside _output_lock) -----------------------
 
     def clear_line(self) -> None:
-        """Blank the progress line. MUST be called while _output_lock is held."""
-        if self._tty and self._running:
-            sys.stderr.write("\r" + " " * self._WIDTH + "\r")
+        """
+        Erase all progress lines and reposition cursor at the start of the
+        first progress line.  MUST be called while _output_lock is held.
+
+        After this call _screen_lines is 0 and the cursor sits at column 0
+        of the line where the top progress row was.  The caller may write an
+        error/pause line there; the next render cycle will append the
+        progress block below it.
+        """
+        if not self._tty or not self._running:
+            return
+        n = self._screen_lines  # safe: we hold _output_lock which also guards this
+        if n == 0:
+            return
+        if n > 1:
+            sys.stderr.write(f"\033[{n - 1}A")   # cursor to first progress line
+        sys.stderr.write("\r")
+        for i in range(n):
+            sys.stderr.write("\033[2K")           # clear current line
+            if i < n - 1:
+                sys.stderr.write("\n")
+        if n > 1:
+            sys.stderr.write(f"\033[{n - 1}A")   # back to first line
+        sys.stderr.write("\r")
+        self._screen_lines = 0
 
     # -- internal ------------------------------------------------------------
+
+    @contextlib.contextmanager
+    def _flock(self):
+        """Exclusive cross-process file lock on _lock_path."""
+        lf = open(self._lock_path, "w")
+        try:
+            fcntl.flock(lf, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lf, fcntl.LOCK_UN)
+        finally:
+            lf.close()
+
+    def _read_coord(self) -> dict:
+        try:
+            with open(self._coord_path) as f:
+                return json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError, ValueError):
+            return {"screen_lines": 0, "slots": []}
+
+    def _write_coord(self, data: dict) -> None:
+        tmp = self._coord_path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(data, f)
+        os.replace(tmp, self._coord_path)
 
     def _loop(self) -> None:
         while self._running:
             self._render()
             time.sleep(0.1)
 
-    def _render(self) -> None:
+    def _build_line(self, *, done: bool = False) -> str:
+        """Build the formatted progress string for this process."""
         with self._lock:
-            elapsed = time.monotonic() - self._start
-            done = self._requests_done
-            cached = self._cache_hits
-            active = self._active
-            paused = self._paused
-            queue = self._queue_size
-            total = self._total_time
-            errors = self._errors
-            failed = self._failed
-            ch = self._SPINNERS[self._spinner_idx % len(self._SPINNERS)]
-            self._spinner_idx += 1
+            elapsed_s  = time.monotonic() - self._start
+            done_reqs  = self._requests_done
+            cached     = self._cache_hits
+            active     = self._active
+            paused     = self._paused
+            queue      = self._queue_size
+            total      = self._total_time
+            errors     = self._errors
+            failed     = self._failed
+            if not done:
+                ch = self._SPINNERS[self._spinner_idx % len(self._SPINNERS)]
+                self._spinner_idx += 1
+            else:
+                ch = None
 
-        avg = total / done if done else 0.0
-
-        h = int(elapsed // 3600)
-        m = int((elapsed % 3600) // 60)
-        s = elapsed % 60
-        if h:
-            elapsed_str = f"{h}h{m:02d}m{s:04.1f}s"
-        elif m:
-            elapsed_str = f"{m}m{s:04.1f}s"
-        else:
-            elapsed_str = f"{s:.1f}s"
+        avg = total / done_reqs if done_reqs else 0.0
+        elapsed_str = _fmt_elapsed(elapsed_s)
+        prefix = f"COMPLETE pid({self._pid}) -- " if done else f"{ch} pid({self._pid}) -- "
 
         line = (
-            f"\r{ch} {elapsed_str}"
-            f"  requests={done}"
+            f"{prefix}{elapsed_str}  {self._cmd_name}"
+            f"  requests={done_reqs}"
             f"  active={active}"
         )
         if paused:
@@ -925,16 +1065,59 @@ class Progress:
             f"  cached={cached}"
             f"  avg={avg:.3f}s/req"
         )
-        # Show error summary only when there are errors (avoids clutter on clean runs)
         if errors:
             line += f"  errors={errors}"
             if failed:
                 line += f"  failed={failed}"
-        # Pad to overwrite any longer previous line, keep cursor on same line
-        pad = max(0, self._WIDTH - len(line) - 1)
+        return line
+
+    @staticmethod
+    def _build_render_str(slots: list, screen_lines: int, n: int) -> str:
+        """
+        Build the ANSI escape sequence that rewrites the progress block.
+
+        screen_lines: lines currently on screen (read from coord file).
+        n:            lines to render now (= len(slots)).
+
+        The cursor is left at the end of the last rendered line (no trailing
+        newline) so subsequent renders can reposition correctly.
+        """
+        out: List[str] = []
+        if screen_lines > 1:
+            out.append(f"\033[{screen_lines - 1}A")  # move up to first line
+        out.append("\r")
+        for i, s in enumerate(slots):
+            out.append("\033[2K")                     # clear current line
+            out.append(s.get("line", ""))
+            if i < n - 1:
+                out.append("\n")
+        return "".join(out)
+
+    def _render(self) -> None:
+        """Update the coord file and redraw the full progress block."""
+        my_line = self._build_line()
+
+        # Phase 1: update the coord file (under flock so other processes see
+        # a consistent screen_lines value when they build their render strings).
+        with self._flock():
+            data = self._read_coord()
+            old_screen = data["screen_lines"]
+            for s in data["slots"]:
+                if s["slot"] == self._slot:
+                    s["line"] = my_line
+                    break
+            n = len(data["slots"])
+            render_str = self._build_render_str(data["slots"], old_screen, n)
+            data["screen_lines"] = n
+            self._write_coord(data)
+        # flock released — another process may now update its slot.
+
+        # Phase 2: write to stderr (under _output_lock so error/pause JSON
+        # lines never interleave with cursor-positioning sequences).
         with _output_lock:
-            sys.stderr.write(line + " " * pad)
+            sys.stderr.write(render_str)
             sys.stderr.flush()
+            self._screen_lines = n
 
 
 # Module-level progress instance; set by main() when --progress is active.
@@ -1320,7 +1503,7 @@ def main():
 
     global _progress
     if getattr(args, "progress", False):
-        _progress = Progress()
+        _progress = Progress(_CMD_LABEL.get(args.command, args.command))
         _progress.start()
 
     try:
