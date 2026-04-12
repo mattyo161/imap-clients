@@ -32,6 +32,7 @@ except ImportError:
 
 log = logging.getLogger(__name__)
 _output_lock = threading.Lock()
+_PID = os.getpid()
 FETCH_BATCH = 200  # UIDs per FETCH command
 
 
@@ -341,8 +342,9 @@ class ConnectionPool:
                 if attempt >= self.max_retries - 1:
                     raise
                 delay = (2 ** attempt) * max(0.5, self.throttle_delay)
-                log.warning("connect attempt %d failed: %s — retry in %.1fs", attempt + 1, exc, delay)
-                time.sleep(delay)
+                emit_err(str(exc), api="connect",
+                         error_code=_imap_error_code(exc))
+                emit_pause(delay, api="connect", attempt=attempt + 1)
         raise RuntimeError("unreachable")
 
     @contextlib.contextmanager
@@ -438,7 +440,8 @@ def op_mailboxes(pool: ConnectionPool, cache: Optional[Cache],
                 obj["exists"] = st.get(b"MESSAGES", 0)
                 obj["unseen"] = st.get(b"UNSEEN", 0)
             except Exception as exc:
-                log.debug("folder_status(%s): %s", name, exc)
+                emit_err(str(exc), api="mailboxes", mailbox=name,
+                         error_code=_imap_error_code(exc))
             results.append(obj)
 
     if cache:
@@ -463,7 +466,8 @@ def op_messages(pool: ConnectionPool, mailbox: str,
         try:
             conn.select_folder(mailbox, readonly=True)
         except Exception as exc:
-            log.error("select_folder(%s): %s", mailbox, exc)
+            emit_err(str(exc), api="messages", mailbox=mailbox,
+                     error_code=_imap_error_code(exc))
             return
 
         criteria: List[Any] = []
@@ -477,7 +481,8 @@ def op_messages(pool: ConnectionPool, mailbox: str,
         try:
             uids: List[int] = conn.search(criteria)
         except Exception as exc:
-            log.error("search(%s): %s", mailbox, exc)
+            emit_err(str(exc), api="messages", mailbox=mailbox,
+                     error_code=_imap_error_code(exc))
             return
 
         if not uids:
@@ -493,10 +498,12 @@ def op_messages(pool: ConnectionPool, mailbox: str,
                     break
                 except Exception as exc:
                     if attempt >= pool.max_retries - 1:
-                        log.error("fetch batch: %s", exc)
+                        emit_err(str(exc), api="messages", mailbox=mailbox,
+                                 error_code=_imap_error_code(exc))
                         data = {}
                     else:
-                        time.sleep(2 ** attempt)
+                        emit_pause(2 ** attempt, api="messages",
+                                   mailbox=mailbox, attempt=attempt + 1)
 
             for uid, item in data.items():
                 env_raw = item.get(b"ENVELOPE")
@@ -532,7 +539,8 @@ def op_fetch(pool: ConnectionPool, mailbox: str, uid: int,
         try:
             conn.select_folder(mailbox, readonly=True)
         except Exception as exc:
-            log.error("select_folder(%s): %s", mailbox, exc)
+            emit_err(str(exc), api="fetch", mailbox=mailbox, uid=uid,
+                     error_code=_imap_error_code(exc))
             return None
 
         for attempt in range(pool.max_retries):
@@ -541,9 +549,11 @@ def op_fetch(pool: ConnectionPool, mailbox: str, uid: int,
                 break
             except Exception as exc:
                 if attempt >= pool.max_retries - 1:
-                    log.error("fetch(%s/%d): %s", mailbox, uid, exc)
+                    emit_err(str(exc), api="fetch", mailbox=mailbox, uid=uid,
+                             error_code=_imap_error_code(exc))
                     return None
-                time.sleep(2 ** attempt)
+                emit_pause(2 ** attempt, api="fetch", mailbox=mailbox,
+                           uid=uid, attempt=attempt + 1)
 
         if uid not in data:
             return None
@@ -587,12 +597,70 @@ def emit(obj: Dict):
         sys.stdout.flush()
 
 
-def emit_err(msg: str, **kw):
+def _imap_error_code(exc: Exception) -> str:
+    """
+    Extract the bracketed IMAP response code from an exception message.
+    e.g. 'select failed: [SERVERBUG] ...' → 'SERVERBUG'
+    Falls back to the exception class name if no code is found.
+    """
+    m = re.search(r'\[([A-Z][A-Z0-9\-]+)\]', str(exc))
+    return m.group(1) if m else type(exc).__name__
+
+
+def emit_err(
+    message: str,
+    *,
+    api: str = "",
+    mailbox: str = "",
+    uid: Optional[int] = None,
+    message_id: str = "",
+    error_code: str = "",
+) -> None:
+    """Write a structured error record to stderr as JSON Lines."""
+    record: Dict[str, Any] = {
+        "type": "error",
+        "timestamp": now_iso(),
+        "pid": _PID,
+        "api": api,
+        "message": message,
+        "error_code": error_code,
+    }
+    if mailbox:
+        record["mailbox"] = mailbox
+    if uid is not None:
+        record["uid"] = uid
+    if message_id:
+        record["message_id"] = message_id
     with _output_lock:
-        sys.stderr.write(
-            json.dumps({"type": "error", "message": msg, **kw}, ensure_ascii=False) + "\n"
-        )
+        sys.stderr.write(json.dumps(record, ensure_ascii=False) + "\n")
         sys.stderr.flush()
+
+
+def emit_pause(
+    delay: float,
+    *,
+    api: str = "",
+    mailbox: str = "",
+    uid: Optional[int] = None,
+    attempt: int = 0,
+) -> None:
+    """Write a backoff-pause record to stderr as JSON Lines, then sleep."""
+    record: Dict[str, Any] = {
+        "type": "pause",
+        "timestamp": now_iso(),
+        "pid": _PID,
+        "api": api,
+        "delay_seconds": round(delay, 3),
+        "attempt": attempt,
+    }
+    if mailbox:
+        record["mailbox"] = mailbox
+    if uid is not None:
+        record["uid"] = uid
+    with _output_lock:
+        sys.stderr.write(json.dumps(record, ensure_ascii=False) + "\n")
+        sys.stderr.flush()
+    time.sleep(delay)
 
 
 # ---------------------------------------------------------------------------
