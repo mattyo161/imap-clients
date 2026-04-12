@@ -466,65 +466,58 @@ def op_messages(pool: ConnectionPool, mailbox: str,
             return
     _call_cached.value = False
 
+    criteria: List[Any] = []
+    if since:
+        criteria += ["SINCE", _to_imap_date(since)]
+    if before:
+        criteria += ["BEFORE", _to_imap_date(before)]
+    if not criteria:
+        criteria = ["ALL"]
+
     results: List[Dict] = []
-    with pool.acquire() as conn:
+    last_exc: Optional[Exception] = None
+
+    for attempt in range(pool.max_retries):
         try:
-            conn.select_folder(mailbox, readonly=True)
-        except Exception as exc:
-            emit_err(str(exc), api="messages", mailbox=mailbox,
-                     error_code=_imap_error_code(exc), failed=True)
-            return
-
-        criteria: List[Any] = []
-        if since:
-            criteria += ["SINCE", _to_imap_date(since)]
-        if before:
-            criteria += ["BEFORE", _to_imap_date(before)]
-        if not criteria:
-            criteria = ["ALL"]
-
-        try:
-            uids: List[int] = conn.search(criteria)
-        except Exception as exc:
-            emit_err(str(exc), api="messages", mailbox=mailbox,
-                     error_code=_imap_error_code(exc))
-            return
-
-        if not uids:
-            return
-        if limit:
-            uids = uids[-limit:]
-
-        for i in range(0, len(uids), FETCH_BATCH):
-            batch = uids[i: i + FETCH_BATCH]
-            for attempt in range(pool.max_retries):
-                try:
+            results = []
+            with pool.acquire() as conn:
+                # select_folder, search, and all batch fetches are inside a
+                # single pool.acquire() so that any IMAP error causes the
+                # connection to be discarded and a fresh one opened on retry.
+                conn.select_folder(mailbox, readonly=True)
+                uids: List[int] = conn.search(criteria)
+                if limit:
+                    uids = uids[-limit:]
+                for i in range(0, len(uids), FETCH_BATCH):
+                    batch = uids[i: i + FETCH_BATCH]
                     data = conn.fetch(batch, ["ENVELOPE", "FLAGS", "RFC822.SIZE", "INTERNALDATE"])
-                    break
-                except Exception as exc:
-                    if attempt >= pool.max_retries - 1:
-                        emit_err(str(exc), api="messages", mailbox=mailbox,
-                                 error_code=_imap_error_code(exc), failed=True)
-                        data = {}
-                    else:
-                        emit_pause(2 ** attempt, api="messages",
-                                   mailbox=mailbox, attempt=attempt + 1)
-
-            for uid, item in data.items():
-                env_raw = item.get(b"ENVELOPE")
-                if env_raw is None:
-                    continue
-                env = parse_envelope(env_raw)
-                internal_date_raw = item.get(b"INTERNALDATE")
-                results.append({
-                    "type": "message",
-                    "mailbox": mailbox,
-                    "uid": uid,
-                    **env,
-                    "internal_date": parse_date(internal_date_raw) if internal_date_raw else "",
-                    "size": item.get(b"RFC822.SIZE", 0),
-                    "flags": flags_to_list(item.get(b"FLAGS", [])),
-                })
+                    for uid, item in data.items():
+                        env_raw = item.get(b"ENVELOPE")
+                        if env_raw is None:
+                            continue
+                        env = parse_envelope(env_raw)
+                        internal_date_raw = item.get(b"INTERNALDATE")
+                        results.append({
+                            "type": "message",
+                            "mailbox": mailbox,
+                            "uid": uid,
+                            **env,
+                            "internal_date": parse_date(internal_date_raw) if internal_date_raw else "",
+                            "size": item.get(b"RFC822.SIZE", 0),
+                            "flags": flags_to_list(item.get(b"FLAGS", [])),
+                        })
+            break  # success — exit retry loop
+        except Exception as exc:
+            last_exc = exc
+            results = []
+            if attempt < pool.max_retries - 1:
+                emit_pause(2 ** attempt, api="messages",
+                           mailbox=mailbox, attempt=attempt + 1)
+    else:
+        # All attempts exhausted
+        emit_err(str(last_exc), api="messages", mailbox=mailbox,
+                 error_code=_imap_error_code(last_exc), failed=True)
+        return
 
     if cache and results:
         cache.set_messages(mailbox, results)
@@ -542,52 +535,59 @@ def op_fetch(pool: ConnectionPool, mailbox: str, uid: int,
             return cached
     _call_cached.value = False
 
-    with pool.acquire() as conn:
-        try:
-            conn.select_folder(mailbox, readonly=True)
-        except Exception as exc:
-            emit_err(str(exc), api="fetch", mailbox=mailbox, uid=uid,
-                     error_code=_imap_error_code(exc), failed=True)
-            return None
+    data: Optional[Dict] = None
+    last_exc: Optional[Exception] = None
 
-        for attempt in range(pool.max_retries):
-            try:
-                data = conn.fetch([uid], ["ENVELOPE", "FLAGS", "RFC822.SIZE", "INTERNALDATE", "RFC822"])
-                break
-            except Exception as exc:
-                if attempt >= pool.max_retries - 1:
-                    emit_err(str(exc), api="fetch", mailbox=mailbox, uid=uid,
-                             error_code=_imap_error_code(exc), failed=True)
-                    return None
+    for attempt in range(pool.max_retries):
+        try:
+            with pool.acquire() as conn:
+                # Both select_folder and fetch are inside a single pool.acquire()
+                # so that any IMAP error causes the connection to be discarded
+                # and a fresh one opened on the next retry attempt.
+                conn.select_folder(mailbox, readonly=True)
+                data = conn.fetch(
+                    [uid],
+                    ["ENVELOPE", "FLAGS", "RFC822.SIZE", "INTERNALDATE", "RFC822"],
+                )
+            break  # success — exit retry loop
+        except Exception as exc:
+            last_exc = exc
+            data = None
+            if attempt < pool.max_retries - 1:
                 emit_pause(2 ** attempt, api="fetch", mailbox=mailbox,
                            uid=uid, attempt=attempt + 1)
+    else:
+        # All attempts exhausted
+        emit_err(str(last_exc), api="fetch", mailbox=mailbox, uid=uid,
+                 error_code=_imap_error_code(last_exc), failed=True)
+        return None
 
-        if uid not in data:
-            return None
-        item = data[uid]
-        env_raw = item.get(b"ENVELOPE")
-        if env_raw is None:
-            return None
+    if data is None or uid not in data:
+        return None
+    item = data[uid]
+    env_raw = item.get(b"ENVELOPE")
+    if env_raw is None:
+        return None
 
-        env = parse_envelope(env_raw)
-        internal_date_raw = item.get(b"INTERNALDATE")
-        raw = item.get(b"RFC822", b"")
-        body_text, body_html, atts = parse_body(raw)
-        hdrs = parse_headers(raw)
+    env = parse_envelope(env_raw)
+    internal_date_raw = item.get(b"INTERNALDATE")
+    raw = item.get(b"RFC822", b"")
+    body_text, body_html, atts = parse_body(raw)
+    hdrs = parse_headers(raw)
 
-        obj: Dict = {
-            "type": "message_content",
-            "mailbox": mailbox,
-            "uid": uid,
-            **env,
-            "internal_date": parse_date(internal_date_raw) if internal_date_raw else "",
-            "size": item.get(b"RFC822.SIZE", 0),
-            "flags": flags_to_list(item.get(b"FLAGS", [])),
-            "headers": hdrs,
-            "body_text": body_text,
-            "body_html": body_html,
-            "attachments": [] if no_attachments else atts,
-        }
+    obj: Dict = {
+        "type": "message_content",
+        "mailbox": mailbox,
+        "uid": uid,
+        **env,
+        "internal_date": parse_date(internal_date_raw) if internal_date_raw else "",
+        "size": item.get(b"RFC822.SIZE", 0),
+        "flags": flags_to_list(item.get(b"FLAGS", [])),
+        "headers": hdrs,
+        "body_text": body_text,
+        "body_html": body_html,
+        "attachments": [] if no_attachments else atts,
+    }
 
     if cache:
         cache.set_message_content(mailbox, uid, obj)
