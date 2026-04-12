@@ -33,8 +33,28 @@ except ImportError:
 log = logging.getLogger(__name__)
 _output_lock = threading.Lock()
 _PID = os.getpid()
-_call_cached = threading.local()   # per-thread flag set by op_* to signal cache hit
+_call_cached = threading.local()    # per-thread flag: cache hit signal from op_*
+_current_conn_id = threading.local()  # per-thread: ID of the connection currently in use
+_shutdown = threading.Event()         # set on Ctrl-C; workers check this to exit early
 FETCH_BATCH = 200  # UIDs per FETCH command
+
+
+class _JsonLogFormatter(logging.Formatter):
+    """Emit each log record as a single JSON Line."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        obj: Dict[str, Any] = {
+            "type": "log",
+            "timestamp": datetime.fromtimestamp(record.created, tz=timezone.utc).isoformat(),
+            "pid": _PID,
+            "thread": record.threadName,
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+        }
+        if record.exc_info:
+            obj["exc"] = self.formatException(record.exc_info)
+        return json.dumps(obj, ensure_ascii=False)
 
 
 # ---------------------------------------------------------------------------
@@ -328,7 +348,9 @@ class _ResizableSemaphore:
     def acquire(self) -> None:
         with self._cond:
             while self._count >= self._limit:
-                self._cond.wait(timeout=0.5)  # re-check periodically
+                if _shutdown.is_set():
+                    raise KeyboardInterrupt
+                self._cond.wait(timeout=0.5)
             self._count += 1
 
     def release(self) -> None:
@@ -441,13 +463,16 @@ class ConnectionPool:
     def acquire(self):
         """Yield a live IMAPClient; return it to the pool afterwards."""
         # Honour the global backoff deadline before competing for a slot.
-        while True:
+        while not _shutdown.is_set():
             remaining = self._backoff_until - time.monotonic()
             if remaining <= 0:
                 break
             time.sleep(min(remaining, 0.5))
+        if _shutdown.is_set():
+            raise KeyboardInterrupt
         self._sem.acquire()
         conn = None
+        _current_conn_id.value = 0  # reset before we know which conn we'll use
         try:
             try:
                 conn = self._pool.get_nowait()
@@ -456,6 +481,7 @@ class ConnectionPool:
                 conn = None
             if conn is None:
                 conn = self._new_conn()
+            _current_conn_id.value = getattr(conn, "_imap_cli_conn_id", 0)
             if self.throttle_delay > 0:
                 time.sleep(self.throttle_delay)
             yield conn
@@ -915,6 +941,7 @@ def emit_err(
     failed=True signals that all retries were exhausted (counted separately
     in the progress display from transient/single errors).
     """
+    conn_id = getattr(_current_conn_id, "value", 0)
     record: Dict[str, Any] = {
         "type": "error",
         "timestamp": now_iso(),
@@ -924,6 +951,8 @@ def emit_err(
         "message": message,
         "error_code": error_code,
     }
+    if conn_id:
+        record["conn_id"] = conn_id
     if mailbox:
         record["mailbox"] = mailbox
     if uid is not None:
@@ -950,6 +979,7 @@ def emit_pause(
     error: str = "",
 ) -> None:
     """Write a backoff-pause record to stderr as JSON Lines, then sleep."""
+    conn_id = getattr(_current_conn_id, "value", 0)
     record: Dict[str, Any] = {
         "type": "pause",
         "timestamp": now_iso(),
@@ -959,6 +989,8 @@ def emit_pause(
         "delay_seconds": round(delay, 3),
         "attempt": attempt,
     }
+    if conn_id:
+        record["conn_id"] = conn_id
     if error:
         record["error"] = error
     if mailbox:
@@ -970,7 +1002,13 @@ def emit_pause(
             _progress.clear_line()
         sys.stderr.write(json.dumps(record, ensure_ascii=False) + "\n")
         sys.stderr.flush()
-    time.sleep(delay)
+    # Interruptible sleep: wake every 0.2 s to check for shutdown signal.
+    deadline = time.monotonic() + delay
+    while not _shutdown.is_set():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(remaining, 0.2))
 
 
 # ---------------------------------------------------------------------------
@@ -1015,9 +1053,12 @@ def cmd_messages(args, pool: ConnectionPool, cache: Optional[Cache]):
                 )
 
     if not sys.stdin.isatty():
-        with ThreadPoolExecutor(max_workers=args.pool_size) as ex:
+        ex = ThreadPoolExecutor(max_workers=args.pool_size)
+        try:
             futs = []
             for line in sys.stdin:
+                if _shutdown.is_set():
+                    break
                 line = line.strip()
                 if not line:
                     continue
@@ -1030,10 +1071,14 @@ def cmd_messages(args, pool: ConnectionPool, cache: Optional[Cache]):
                         _progress.add_queue(1)
                     futs.append(ex.submit(process, obj["name"]))
             for f in as_completed(futs):
+                if _shutdown.is_set():
+                    break
                 try:
                     f.result()
                 except Exception as exc:
                     emit_err(str(exc))
+        finally:
+            ex.shutdown(wait=False, cancel_futures=True)
     elif getattr(args, "mailbox", None):
         if _progress:
             _progress.add_queue(1)
@@ -1062,9 +1107,12 @@ def cmd_fetch(args, pool: ConnectionPool, cache: Optional[Cache]):
                 )
 
     if not sys.stdin.isatty():
-        with ThreadPoolExecutor(max_workers=args.pool_size) as ex:
+        ex = ThreadPoolExecutor(max_workers=args.pool_size)
+        try:
             futs = []
             for line in sys.stdin:
+                if _shutdown.is_set():
+                    break
                 line = line.strip()
                 if not line:
                     continue
@@ -1077,10 +1125,14 @@ def cmd_fetch(args, pool: ConnectionPool, cache: Optional[Cache]):
                         _progress.add_queue(1)
                     futs.append(ex.submit(process, obj["mailbox"], int(obj["uid"])))
             for f in as_completed(futs):
+                if _shutdown.is_set():
+                    break
                 try:
                     f.result()
                 except Exception as exc:
                     emit_err(str(exc))
+        finally:
+            ex.shutdown(wait=False, cancel_futures=True)
     elif getattr(args, "mailbox", None) and getattr(args, "uid", None) is not None:
         if _progress:
             _progress.add_queue(1)
@@ -1120,7 +1172,13 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--clear-cache", action="store_true",
                    help="Wipe cache before running")
 
-    p.add_argument("--verbose", "-v", action="store_true")
+    p.add_argument("--verbose", "-v", action="count", default=0,
+                   help="-v: DEBUG for imap-cli, INFO for imapclient; "
+                        "-vv: DEBUG for both")
+    p.add_argument("--log-file", default=os.environ.get("IMAP_CLI_LOG_FILE", ""),
+                   metavar="PATH",
+                   help="Write log output to PATH instead of stderr "
+                        "(env: IMAP_CLI_LOG_FILE)")
     p.add_argument("--progress", "-p", action="store_true",
                    help="Show live progress (spinner, elapsed, requests, queue, avg/req) on stderr")
 
@@ -1148,11 +1206,23 @@ def main():
     parser = build_parser()
     args = parser.parse_args()
 
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.WARNING,
-        stream=sys.stderr,
-        format="%(asctime)s %(levelname)s %(message)s",
+    # Configure logging: JSON Lines format, verbosity-controlled levels.
+    #   -v   → imap-cli=DEBUG,  imapclient=INFO
+    #   -vv  → imap-cli=DEBUG,  imapclient=DEBUG
+    #   none → WARNING for all
+    our_level = logging.DEBUG if args.verbose >= 1 else logging.WARNING
+    imap_level = logging.DEBUG if args.verbose >= 2 else (
+        logging.INFO if args.verbose == 1 else logging.WARNING
     )
+    log_stream: Any = open(args.log_file, "a", encoding="utf-8") if args.log_file else sys.stderr
+    handler = logging.StreamHandler(log_stream)
+    handler.setFormatter(_JsonLogFormatter())
+    root_logger = logging.getLogger()
+    root_logger.handlers.clear()
+    root_logger.addHandler(handler)
+    root_logger.setLevel(logging.DEBUG)   # root wide-open; levels set per logger
+    logging.getLogger(__name__).setLevel(our_level)
+    logging.getLogger("imapclient").setLevel(imap_level)
 
     # Resolve password — env var takes precedence over --password
     password: str = ""
@@ -1197,8 +1267,9 @@ def main():
         }
         dispatch[args.command](args, pool, cache)
     except KeyboardInterrupt:
-        pass
+        _shutdown.set()
     finally:
+        _shutdown.set()  # ensure workers see it even on normal exit
         if _progress:
             _progress.stop()
         pool.close()
