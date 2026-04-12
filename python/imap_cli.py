@@ -365,23 +365,40 @@ class ConnectionPool:
         self._sem = _ResizableSemaphore(pool_size)
         self._throttle_lock = threading.Lock()
         self._throttle_events: int = 0  # count of in-flight throttle recoveries
+        self._backoff_until: float = 0.0  # monotonic timestamp: don't acquire before this
+        self._conn_id_counter: int = 0    # incremented per new connection
 
     # -- throttle management -------------------------------------------------
 
-    def on_throttle(self) -> None:
+    def _flush_idle(self) -> None:
+        """Drain and close all idle connections sitting in the pool queue."""
+        while True:
+            try:
+                conn = self._pool.get_nowait()
+                try:
+                    conn.logout()
+                except Exception:
+                    pass
+            except queue.Empty:
+                break
+
+    def on_throttle(self, backoff_seconds: float = 0.0) -> None:
         """
         Called when any IMAP operation receives a server error.
-        Reduces active concurrency to 1 so that retries don't hammer the
-        server with the same number of parallel connections that got us
-        throttled in the first place.
+        Reduces active concurrency to 1, extends the global backoff deadline,
+        and flushes idle connections so retries start with fresh ones.
         """
         with self._throttle_lock:
             self._throttle_events += 1
+            deadline = time.monotonic() + backoff_seconds
+            if deadline > self._backoff_until:
+                self._backoff_until = deadline
             self._sem.set_limit(1)
             log.debug(
                 "throttle detected — reducing pool concurrency to 1 "
-                "(throttle_events=%d)", self._throttle_events
+                "(throttle_events=%d, backoff=%.1fs)", self._throttle_events, backoff_seconds
             )
+        self._flush_idle()
 
     def on_success(self) -> None:
         """
@@ -407,6 +424,10 @@ class ConnectionPool:
                     ssl=self.ssl, use_uid=True, timeout=30,
                 )
                 c.login(self.user, self.password)
+                with self._throttle_lock:
+                    self._conn_id_counter += 1
+                    conn_id = self._conn_id_counter
+                c._imap_cli_conn_id = conn_id  # type: ignore[attr-defined]
                 return c
             except Exception as exc:
                 if attempt >= self.max_retries - 1:
@@ -419,6 +440,12 @@ class ConnectionPool:
     @contextlib.contextmanager
     def acquire(self):
         """Yield a live IMAPClient; return it to the pool afterwards."""
+        # Honour the global backoff deadline before competing for a slot.
+        while True:
+            remaining = self._backoff_until - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(remaining, 0.5))
         self._sem.acquire()
         conn = None
         try:
@@ -579,11 +606,18 @@ def op_messages(pool: ConnectionPool, mailbox: str,
         except Exception as exc:
             last_exc = exc
             results = []
-            pool.on_throttle()
+            delay = 5 * (2 ** attempt)
+            pool.on_throttle(delay)
             if attempt < pool.max_retries - 1:
-                emit_pause(5 * (2 ** attempt), api="messages",
-                           mailbox=mailbox, attempt=attempt + 1,
-                           error=str(exc))
+                if _progress:
+                    _progress.start_pause()
+                try:
+                    emit_pause(delay, api="messages",
+                               mailbox=mailbox, attempt=attempt + 1,
+                               error=str(exc))
+                finally:
+                    if _progress:
+                        _progress.end_pause()
     else:
         # All attempts exhausted
         emit_err(str(last_exc), api="messages", mailbox=mailbox,
@@ -625,10 +659,17 @@ def op_fetch(pool: ConnectionPool, mailbox: str, uid: int,
         except Exception as exc:
             last_exc = exc
             data = None
-            pool.on_throttle()
+            delay = 5 * (2 ** attempt)
+            pool.on_throttle(delay)
             if attempt < pool.max_retries - 1:
-                emit_pause(5 * (2 ** attempt), api="fetch", mailbox=mailbox,
-                           uid=uid, attempt=attempt + 1, error=str(exc))
+                if _progress:
+                    _progress.start_pause()
+                try:
+                    emit_pause(delay, api="fetch", mailbox=mailbox,
+                               uid=uid, attempt=attempt + 1, error=str(exc))
+                finally:
+                    if _progress:
+                        _progress.end_pause()
     else:
         # All attempts exhausted
         emit_err(str(last_exc), api="fetch", mailbox=mailbox, uid=uid,
@@ -715,6 +756,7 @@ class Progress:
         self._total_time: float = 0.0  # wall time for IMAP requests only
         self._errors: int = 0          # total error events emitted
         self._failed: int = 0          # requests that exhausted all retries
+        self._paused: int = 0          # threads currently sleeping in backoff
         self._spinner_idx: int = 0
         self._running: bool = False
         self._tty: bool = sys.stderr.isatty()
@@ -778,6 +820,18 @@ class Progress:
             if failed:
                 self._failed += 1
 
+    def start_pause(self) -> None:
+        """Called just before a backoff sleep: moves one item active→paused."""
+        with self._lock:
+            self._active = max(0, self._active - 1)
+            self._paused += 1
+
+    def end_pause(self) -> None:
+        """Called just after a backoff sleep: moves one item paused→active."""
+        with self._lock:
+            self._paused = max(0, self._paused - 1)
+            self._active += 1
+
     # -- line management (called inside _output_lock) -----------------------
 
     def clear_line(self) -> None:
@@ -798,6 +852,7 @@ class Progress:
             done = self._requests_done
             cached = self._cache_hits
             active = self._active
+            paused = self._paused
             queue = self._queue_size
             total = self._total_time
             errors = self._errors
@@ -821,6 +876,10 @@ class Progress:
             f"\r{ch} {elapsed_str}"
             f"  requests={done}"
             f"  active={active}"
+        )
+        if paused:
+            line += f"  paused={paused}"
+        line += (
             f"  queue={queue}"
             f"  cached={cached}"
             f"  avg={avg:.3f}s/req"
@@ -860,6 +919,7 @@ def emit_err(
         "type": "error",
         "timestamp": now_iso(),
         "pid": _PID,
+        "thread": threading.current_thread().name,
         "api": api,
         "message": message,
         "error_code": error_code,
@@ -894,6 +954,7 @@ def emit_pause(
         "type": "pause",
         "timestamp": now_iso(),
         "pid": _PID,
+        "thread": threading.current_thread().name,
         "api": api,
         "delay_seconds": round(delay, 3),
         "attempt": attempt,
