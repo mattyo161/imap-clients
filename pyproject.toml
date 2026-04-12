@@ -1,0 +1,44 @@
+[project]
+name = "imap-cli"
+version = "0.1.0"
+description = "Universal IMAP client CLI — JSON Lines output, connection pooling, SQLite cache"
+requires-python = ">=3.9"
+dependencies = [
+    "imapclient>=2.3.1",
+]
+
+[project.scripts]
+imap-cli = "imap_cli:main"
+
+# ---------------------------------------------------------------------------
+# python-semantic-release
+# ---------------------------------------------------------------------------
+
+[tool.semantic_release]
+version_variables = [
+    "python/imap_cli.py:__version__",
+    "pyproject.toml:project.version",
+]
+tag_format = "v{version}"
+commit_message = "chore(release): v{version} [skip ci]"
+commit_parser = "conventional"
+logging_use_named_masks = false
+major_on_zero = false          # 0.x: breaking changes → minor, not major
+
+[tool.semantic_release.branches.main]
+match = "main"
+prerelease = false
+
+[tool.semantic_release.changelog]
+changelog_file = "CHANGELOG.md"
+exclude_commit_patterns = [
+    "^chore\\(release\\):",
+    "^Merge ",
+]
+
+[tool.semantic_release.publish]
+upload_to_vcs_release = true   # attach assets to the GitHub release
+dist_glob_patterns = []        # no build artifacts for this CLI tool
+
+[tool.semantic_release.remote]
+type = "github"

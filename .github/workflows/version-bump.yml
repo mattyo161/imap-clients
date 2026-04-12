@@ -1,0 +1,82 @@
+name: Version Bump
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+
+# Cancel stale runs when new commits arrive; never leave the PR in a
+# half-bumped state by letting two runs race.
+concurrency:
+  group: version-bump-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write   # push version-bump commit back to the PR branch
+  pull-requests: read
+
+jobs:
+  bump:
+    name: Compute and commit version bump
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # full history so semantic-release can walk commits
+          ref: ${{ github.head_ref }}
+          token: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Fetch all tags
+        run: git fetch --tags --force
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Install python-semantic-release
+        run: pip install python-semantic-release
+
+      - name: Configure git identity
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Bump version files and update CHANGELOG
+        id: bump
+        run: |
+          HEAD_BEFORE=$(git rev-parse HEAD)
+
+          # --no-push        : we push manually so we control the ref
+          # --no-tag         : tags are created by the release workflow after merge
+          # --no-vcs-release : GitHub release is created by the release workflow
+          semantic-release version \
+            --no-push \
+            --no-tag \
+            --no-vcs-release || true
+
+          HEAD_AFTER=$(git rev-parse HEAD)
+          if [ "$HEAD_BEFORE" != "$HEAD_AFTER" ]; then
+            echo "bumped=true" >> "$GITHUB_OUTPUT"
+            echo "version=$(git log -1 --pretty=%s | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')" >> "$GITHUB_OUTPUT"
+          else
+            echo "bumped=false" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Push version bump commit to PR branch
+        if: steps.bump.outputs.bumped == 'true'
+        run: git push origin HEAD:${{ github.head_ref }}
+
+      - name: Summarise
+        run: |
+          if [ "${{ steps.bump.outputs.bumped }}" = "true" ]; then
+            echo "### Version bump committed" >> "$GITHUB_STEP_SUMMARY"
+            echo "Next release: \`v${{ steps.bump.outputs.version }}\`" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "### No version bump needed" >> "$GITHUB_STEP_SUMMARY"
+            echo "No releasable commits found (chore/docs/style/etc. only)." >> "$GITHUB_STEP_SUMMARY"
+          fi

@@ -1,0 +1,76 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+# Only one release job at a time — prevents races when commits land quickly.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: write        # create tag + GitHub release
+  issues: write          # comment on issues referenced in commits
+  pull-requests: write   # comment on PRs referenced in commits
+  id-token: write        # OIDC (future PyPI trusted publishing)
+
+jobs:
+  release:
+    name: Tag and publish release
+    runs-on: ubuntu-latest
+
+    steps:
+      # Full history is required so semantic-release can walk commits.
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Fetch all tags
+        run: git fetch --tags --force
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Install python-semantic-release
+        run: pip install python-semantic-release
+
+      - name: Configure git identity
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Tag and publish release
+        # The version bump and CHANGELOG were already committed to the PR branch
+        # before merge (by version-bump.yml), so:
+        #
+        #   --no-commit    : version files are already correct; skip the commit
+        #   --no-changelog : CHANGELOG was already written in the PR
+        #
+        # semantic-release will detect that the files haven't changed, tag the
+        # merge commit, push the tag, and create the GitHub release — no extra
+        # commit lands on main.
+        run: |
+          semantic-release version \
+            --no-commit \
+            --no-changelog
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
+
+      # -----------------------------------------------------------------------
+      # Optional: upload build artefacts to the release
+      # Uncomment and adjust if you start packaging imap-cli as a wheel/sdist.
+      # -----------------------------------------------------------------------
+      # - name: Build distribution
+      #   run: pip install build && python -m build
+      #
+      # - name: Upload to GitHub Release
+      #   uses: python-semantic-release/upload-to-gh-release@v9
+      #   if: steps.release.outputs.released == 'true'
+      #   with:
+      #     github_token: ${{ secrets.GITHUB_TOKEN }}
+      #     tag: ${{ steps.release.outputs.tag }}
