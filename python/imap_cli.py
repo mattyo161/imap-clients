@@ -6,6 +6,8 @@ Dependencies:  pip install imapclient
 Pipeline:      imap-cli ... mailboxes | imap-cli ... messages | imap-cli ... fetch
 """
 
+__version__ = "0.1.0"
+
 import argparse
 import contextlib
 import email as email_lib

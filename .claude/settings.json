@@ -10,6 +10,17 @@
           }
         ]
       }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cmd=$(jq -r '.tool_input.command // \"\"' 2>/dev/null); if echo \"$cmd\" | grep -q 'git push'; then printf '{\"hookSpecificOutput\":{\"hookEventName\":\"PostToolUse\",\"additionalContext\":\"A git push just completed. If there is an open PR for this branch, update its description now using mcp__github__update_pull_request so it reflects all cumulative changes made so far — not just the latest commit.\"}}'; fi"
+          }
+        ]
+      }
     ]
   }
 }
