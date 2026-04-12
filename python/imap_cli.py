@@ -358,6 +358,11 @@ class _ResizableSemaphore:
             self._count -= 1
             self._cond.notify_all()
 
+    @property
+    def count(self) -> int:
+        with self._cond:
+            return self._count
+
     def set_limit(self, new_limit: int) -> None:
         with self._cond:
             self._limit = max(1, new_limit)
@@ -498,6 +503,14 @@ class ConnectionPool:
                         conn.logout()
                     except Exception:
                         pass
+
+    def active_count(self) -> int:
+        """Number of connections currently held by worker threads."""
+        return self._sem.count
+
+    def idle_count(self) -> int:
+        """Number of connections sitting idle in the pool queue."""
+        return self._pool.qsize()
 
     def close(self):
         while not self._pool.empty():
@@ -1142,6 +1155,55 @@ def cmd_fetch(args, pool: ConnectionPool, cache: Optional[Cache]):
 
 
 # ---------------------------------------------------------------------------
+# Shutdown helpers
+# ---------------------------------------------------------------------------
+
+def _emit_shutdown_progress(pool: ConnectionPool) -> None:
+    """
+    Poll until all active connections have been released, emitting a JSON Lines
+    status record each time the count changes.  Ends with a shutdown_complete
+    record regardless of how long it takes.
+    """
+    t0 = time.monotonic()
+    last_active = -1
+    while True:
+        active = pool.active_count()
+        idle = pool.idle_count()
+        if active == 0:
+            break
+        if active != last_active:
+            record: Dict[str, Any] = {
+                "type": "shutdown",
+                "timestamp": now_iso(),
+                "pid": _PID,
+                "waiting_for": active,
+                "idle_connections": idle,
+                "message": f"waiting for {active} active connection(s) to close",
+            }
+            with _output_lock:
+                if _progress:
+                    _progress.clear_line()
+                sys.stderr.write(json.dumps(record, ensure_ascii=False) + "\n")
+                sys.stderr.flush()
+            last_active = active
+        time.sleep(0.25)
+
+    elapsed = round(time.monotonic() - t0, 3)
+    record = {
+        "type": "shutdown_complete",
+        "timestamp": now_iso(),
+        "pid": _PID,
+        "elapsed_seconds": elapsed,
+        "message": "clean shutdown",
+    }
+    with _output_lock:
+        if _progress:
+            _progress.clear_line()
+        sys.stderr.write(json.dumps(record, ensure_ascii=False) + "\n")
+        sys.stderr.flush()
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -1268,6 +1330,7 @@ def main():
         dispatch[args.command](args, pool, cache)
     except KeyboardInterrupt:
         _shutdown.set()
+        _emit_shutdown_progress(pool)
     finally:
         _shutdown.set()  # ensure workers see it even on normal exit
         if _progress:
