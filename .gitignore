@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+dist/
+build/
+*.egg-info/
+
+# Go
+golang/imap-cli
+golang/*.test
+
+# Node / TypeScript
+node_modules/
+typescript/dist/
+nodejs/dist/
+
+# Rust
+target/
+
+# Cache / runtime
+*.imap-cache/
+*.db
+*.db-shm
+*.db-wal
+
+# Editor / OS
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/
