@@ -2,48 +2,66 @@ package main
 
 import (
 	"bufio"
-	"bytes"
 	"crypto/tls"
 	"database/sql"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
+	"math"
 	"mime"
 	"mime/multipart"
-	"mime/quotedprintable"
-	"net"
 	"net/mail"
-	"net/textproto"
 	"os"
 	"path/filepath"
-	"regexp"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	imap "github.com/emersion/go-imap"
-	"github.com/emersion/go-imap/client"
+	"github.com/emersion/go-imap/v2"
+	"github.com/emersion/go-imap/v2/imapclient"
+	_ "github.com/emersion/go-message/charset"
 	"github.com/spf13/cobra"
 	_ "github.com/mattn/go-sqlite3"
 )
 
 // ---------------------------------------------------------------------------
+// Config & global state
+// ---------------------------------------------------------------------------
+
+type Config struct {
+	Host          string
+	Port          int
+	User          string
+	Password      string
+	NoSSL         bool
+	PoolSize      int
+	ThrottleDelay float64
+	MaxRetries    int
+	CacheDir      string
+	NoCache       bool
+	ClearCache    bool
+	Verbose       bool
+}
+
+var cfg Config
+
+// outputMu protects stdout JSON Lines output.
+var outputMu sync.Mutex
+
+// ---------------------------------------------------------------------------
 // JSON output types
 // ---------------------------------------------------------------------------
 
-type MailboxObj struct {
+type MailboxRecord struct {
 	Type      string   `json:"type"`
 	Name      string   `json:"name"`
 	Delimiter string   `json:"delimiter"`
 	Flags     []string `json:"flags"`
-	Exists    *uint32  `json:"exists"`
-	Unseen    *uint32  `json:"unseen"`
+	Exists    *int     `json:"exists"`
+	Unseen    *int     `json:"unseen"`
 }
 
-type MessageObj struct {
+type MessageRecord struct {
 	Type      string   `json:"type"`
 	Mailbox   string   `json:"mailbox"`
 	UID       uint32   `json:"uid"`
@@ -65,7 +83,7 @@ type Attachment struct {
 	ContentID   string `json:"content_id"`
 }
 
-type MessageContentObj struct {
+type MessageContentRecord struct {
 	Type        string            `json:"type"`
 	Mailbox     string            `json:"mailbox"`
 	UID         uint32            `json:"uid"`
@@ -85,338 +103,123 @@ type MessageContentObj struct {
 }
 
 // ---------------------------------------------------------------------------
-// Global config & output helpers
+// Output helpers
 // ---------------------------------------------------------------------------
 
-type Config struct {
-	Host          string
-	Port          int
-	User          string
-	Password      string
-	NoSSL         bool
-	PoolSize      int
-	ThrottleDelay float64
-	MaxRetries    int
-	CacheDir      string
-	NoCache       bool
-	ClearCache    bool
-	Verbose       bool
-}
-
-var cfg Config
-var stdoutMu sync.Mutex
-
-func emit(v interface{}) {
-	b, _ := json.Marshal(v)
-	stdoutMu.Lock()
+func writeJSON(v interface{}) {
+	b, err := json.Marshal(v)
+	if err != nil {
+		writeError(fmt.Sprintf("json marshal: %v", err))
+		return
+	}
+	outputMu.Lock()
+	defer outputMu.Unlock()
 	os.Stdout.Write(b)
 	os.Stdout.Write([]byte("\n"))
-	stdoutMu.Unlock()
 }
 
-func emitErr(msg string) {
+func writeError(msg string) {
 	b, _ := json.Marshal(map[string]string{"type": "error", "message": msg})
+	outputMu.Lock()
+	defer outputMu.Unlock()
 	os.Stderr.Write(b)
 	os.Stderr.Write([]byte("\n"))
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-var nonAlnum = regexp.MustCompile(`[^\w.\-]`)
-
-func safeFilename(s string) string {
-	return nonAlnum.ReplaceAllString(s, "_")
+func logVerbose(format string, args ...interface{}) {
+	if cfg.Verbose {
+		fmt.Fprintf(os.Stderr, "[verbose] "+format+"\n", args...)
+	}
 }
+
+// ---------------------------------------------------------------------------
+// Address formatting
+// ---------------------------------------------------------------------------
 
 func formatAddr(a *imap.Address) string {
 	if a == nil {
 		return ""
 	}
-	if a.MailboxName != "" && a.HostName != "" {
-		email := a.MailboxName + "@" + a.HostName
-		if a.PersonalName != "" {
-			return a.PersonalName + " <" + email + ">"
-		}
-		return email
+	email := a.Mailbox + "@" + a.Host
+	if a.Name != "" {
+		return a.Name + " <" + email + ">"
 	}
-	return a.PersonalName
+	return email
 }
 
-func formatAddrs(addrs []*imap.Address) []string {
+func formatAddrs(addrs []imap.Address) []string {
 	out := make([]string, 0, len(addrs))
-	for _, a := range addrs {
-		if s := formatAddr(a); s != "" {
+	for i := range addrs {
+		s := formatAddr(&addrs[i])
+		if s != "" {
 			out = append(out, s)
 		}
-	}
-	if out == nil {
-		return []string{}
 	}
 	return out
 }
 
-func parseIMAPDate(s string) (time.Time, error) {
-	return time.Parse("02-Jan-2006", s)
+func formatDate(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.UTC().Format(time.RFC3339)
 }
 
 // ---------------------------------------------------------------------------
-// Body parsing (stdlib only)
+// Connection helpers
 // ---------------------------------------------------------------------------
 
-func decodeBody(r io.Reader, transferEnc string) []byte {
-	raw, _ := io.ReadAll(r)
-	switch strings.ToLower(strings.TrimSpace(transferEnc)) {
-	case "base64":
-		var filtered []byte
-		for _, b := range raw {
-			if b != ' ' && b != '\t' && b != '\r' && b != '\n' {
-				filtered = append(filtered, b)
-			}
-		}
-		dec := make([]byte, base64.StdEncoding.DecodedLen(len(filtered)))
-		n, err := base64.StdEncoding.Decode(dec, filtered)
-		if err != nil {
-			// try raw (no padding)
-			dec2 := make([]byte, base64.RawStdEncoding.DecodedLen(len(filtered)))
-			n2, _ := base64.RawStdEncoding.Decode(dec2, filtered)
-			return dec2[:n2]
-		}
-		return dec[:n]
-	case "quoted-printable":
-		dec, _ := io.ReadAll(quotedprintable.NewReader(bytes.NewReader(raw)))
-		return dec
-	default:
-		return raw
+func resolvePort() int {
+	if cfg.Port != 0 {
+		return cfg.Port
 	}
+	if cfg.NoSSL {
+		return 143
+	}
+	return 993
 }
 
-func processPartRec(h textproto.MIMEHeader, r io.Reader,
-	bodyText, bodyHTML *string, atts *[]Attachment) {
+func newConn() (*imapclient.Client, error) {
+	addr := fmt.Sprintf("%s:%d", cfg.Host, resolvePort())
+	logVerbose("connecting to %s (ssl=%v)", addr, !cfg.NoSSL)
 
-	ct := h.Get("Content-Type")
-	if ct == "" {
-		ct = "text/plain"
-	}
-	mediaType, params, err := mime.ParseMediaType(ct)
-	if err != nil {
-		return
-	}
+	var c *imapclient.Client
+	var err error
 
-	if strings.HasPrefix(mediaType, "multipart/") {
-		mr := multipart.NewReader(r, params["boundary"])
-		for {
-			part, err := mr.NextRawPart()
-			if err != nil {
-				break
-			}
-			processPartRec(textproto.MIMEHeader(part.Header), part, bodyText, bodyHTML, atts)
-		}
-		return
-	}
-
-	body := decodeBody(r, h.Get("Content-Transfer-Encoding"))
-
-	disp := h.Get("Content-Disposition")
-	dispType, dispParams, _ := mime.ParseMediaType(disp)
-	filename := dispParams["filename"]
-	if filename == "" {
-		_, ctParams, _ := mime.ParseMediaType(ct)
-		filename = ctParams["name"]
-	}
-	if filename != "" {
-		if dec, err := new(mime.WordDecoder).DecodeHeader(filename); err == nil {
-			filename = dec
-		}
-	}
-	cid := strings.Trim(h.Get("Content-Id"), " <>")
-
-	isAttachment := dispType == "attachment" || (filename != "" && dispType != "inline")
-	if isAttachment {
-		*atts = append(*atts, Attachment{
-			Filename:    filename,
-			ContentType: mediaType,
-			Size:        len(body),
-			ContentID:   cid,
-		})
-		return
-	}
-
-	switch mediaType {
-	case "text/plain":
-		if *bodyText == "" {
-			*bodyText = string(body)
-		}
-	case "text/html":
-		if *bodyHTML == "" {
-			*bodyHTML = string(body)
-		}
-	}
-}
-
-func parseBodyBytes(rawMsg []byte) (bodyText, bodyHTML string, atts []Attachment, headers map[string]string) {
-	headers = make(map[string]string)
-	atts = []Attachment{}
-
-	msg, err := mail.ReadMessage(bytes.NewReader(rawMsg))
-	if err != nil {
-		return
-	}
-	for k, vs := range msg.Header {
-		if len(vs) > 0 {
-			headers[k] = vs[0]
-		}
-	}
-
-	h := make(textproto.MIMEHeader)
-	for k, vs := range msg.Header {
-		h[k] = vs
-	}
-	processPartRec(h, msg.Body, &bodyText, &bodyHTML, &atts)
-	return
-}
-
-// ---------------------------------------------------------------------------
-// SQLite cache
-// ---------------------------------------------------------------------------
-
-type Cache struct {
-	db *sql.DB
-	mu sync.Mutex
-}
-
-func NewCache(cacheDir, host, user string) (*Cache, error) {
-	if err := os.MkdirAll(cacheDir, 0700); err != nil {
-		return nil, err
-	}
-	path := filepath.Join(cacheDir, safeFilename(host+"_"+user)+".db")
-	db, err := sql.Open("sqlite3", path+"?_journal_mode=WAL&_synchronous=NORMAL")
-	if err != nil {
-		return nil, err
-	}
-	c := &Cache{db: db}
-	return c, c.init()
-}
-
-func (c *Cache) init() error {
-	_, err := c.db.Exec(`
-		CREATE TABLE IF NOT EXISTS mailboxes (
-			name TEXT PRIMARY KEY, data TEXT NOT NULL, fetched_at TEXT NOT NULL
-		);
-		CREATE TABLE IF NOT EXISTS messages (
-			mailbox TEXT NOT NULL, uid INTEGER NOT NULL,
-			data TEXT NOT NULL, fetched_at TEXT NOT NULL,
-			PRIMARY KEY (mailbox, uid)
-		);
-		CREATE TABLE IF NOT EXISTS message_content (
-			mailbox TEXT NOT NULL, uid INTEGER NOT NULL,
-			data TEXT NOT NULL, fetched_at TEXT NOT NULL,
-			PRIMARY KEY (mailbox, uid)
-		);`)
-	return err
-}
-
-func (c *Cache) Close() { c.db.Close() }
-
-func (c *Cache) Clear() error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	_, err := c.db.Exec(`DELETE FROM mailboxes; DELETE FROM messages; DELETE FROM message_content;`)
-	return err
-}
-
-func (c *Cache) GetMailboxes() ([]MailboxObj, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	rows, err := c.db.Query("SELECT data FROM mailboxes ORDER BY name")
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []MailboxObj
-	for rows.Next() {
-		var s string
-		if rows.Scan(&s) == nil {
-			var o MailboxObj
-			if json.Unmarshal([]byte(s), &o) == nil {
-				out = append(out, o)
-			}
-		}
-	}
-	return out, nil
-}
-
-func (c *Cache) SetMailboxes(items []MailboxObj) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	tx, _ := c.db.Begin()
-	tx.Exec("DELETE FROM mailboxes")
-	now := time.Now().UTC().Format(time.RFC3339)
-	for _, m := range items {
-		b, _ := json.Marshal(m)
-		tx.Exec("INSERT OR REPLACE INTO mailboxes(name,data,fetched_at) VALUES(?,?,?)", m.Name, string(b), now)
-	}
-	return tx.Commit()
-}
-
-func (c *Cache) GetMessages(mailbox string) ([]MessageObj, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	rows, err := c.db.Query("SELECT data FROM messages WHERE mailbox=? ORDER BY uid", mailbox)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []MessageObj
-	for rows.Next() {
-		var s string
-		if rows.Scan(&s) == nil {
-			var o MessageObj
-			if json.Unmarshal([]byte(s), &o) == nil {
-				out = append(out, o)
-			}
-		}
-	}
-	return out, nil
-}
-
-func (c *Cache) SetMessages(mailbox string, items []MessageObj) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	now := time.Now().UTC().Format(time.RFC3339)
-	tx, _ := c.db.Begin()
-	for _, m := range items {
-		b, _ := json.Marshal(m)
-		tx.Exec("INSERT OR REPLACE INTO messages(mailbox,uid,data,fetched_at) VALUES(?,?,?,?)",
-			mailbox, m.UID, string(b), now)
-	}
-	return tx.Commit()
-}
-
-func (c *Cache) GetMessageContent(mailbox string, uid uint32) (*MessageContentObj, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	var s string
-	err := c.db.QueryRow("SELECT data FROM message_content WHERE mailbox=? AND uid=?", mailbox, uid).Scan(&s)
-	if err == sql.ErrNoRows {
-		return nil, nil
+	if cfg.NoSSL {
+		c, err = imapclient.Dial(addr, nil)
+	} else {
+		tlsCfg := &tls.Config{ServerName: cfg.Host}
+		c, err = imapclient.DialTLS(addr, &imapclient.Options{TLSConfig: tlsCfg})
 	}
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("dial: %w", err)
 	}
-	var o MessageContentObj
-	return &o, json.Unmarshal([]byte(s), &o)
+
+	if err := c.Login(cfg.User, cfg.Password).Wait(); err != nil {
+		c.Close()
+		return nil, fmt.Errorf("login: %w", err)
+	}
+	logVerbose("logged in as %s", cfg.User)
+	return c, nil
 }
 
-func (c *Cache) SetMessageContent(mailbox string, uid uint32, obj *MessageContentObj) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	b, _ := json.Marshal(obj)
-	_, err := c.db.Exec(
-		"INSERT OR REPLACE INTO message_content(mailbox,uid,data,fetched_at) VALUES(?,?,?,?)",
-		mailbox, uid, string(b), time.Now().UTC().Format(time.RFC3339))
-	return err
+func newConnWithRetry() (*imapclient.Client, error) {
+	var lastErr error
+	for attempt := 0; attempt < cfg.MaxRetries; attempt++ {
+		if attempt > 0 {
+			delay := time.Duration(math.Pow(2, float64(attempt-1))*500) * time.Millisecond
+			logVerbose("retry %d after %v", attempt, delay)
+			time.Sleep(delay)
+		}
+		c, err := newConn()
+		if err == nil {
+			return c, nil
+		}
+		lastErr = err
+		logVerbose("connection attempt %d failed: %v", attempt+1, err)
+	}
+	return nil, fmt.Errorf("all %d connection attempts failed: %w", cfg.MaxRetries, lastErr)
 }
 
 // ---------------------------------------------------------------------------
@@ -424,97 +227,62 @@ func (c *Cache) SetMessageContent(mailbox string, uid uint32, obj *MessageConten
 // ---------------------------------------------------------------------------
 
 type Pool struct {
-	idle chan *client.Client
-	sem  chan struct{}
-	cfg  *Config
+	ch     chan *imapclient.Client
+	config Config
+	mu     sync.Mutex
 }
 
-func NewPool(cfg *Config) *Pool {
+func NewPool(config Config, size int) *Pool {
 	return &Pool{
-		idle: make(chan *client.Client, cfg.PoolSize),
-		sem:  make(chan struct{}, cfg.PoolSize),
-		cfg:  cfg,
+		ch:     make(chan *imapclient.Client, size),
+		config: config,
 	}
 }
 
-func (p *Pool) newConn() (*client.Client, error) {
-	port := p.cfg.Port
-	if port == 0 {
-		if p.cfg.NoSSL {
-			port = 143
-		} else {
-			port = 993
-		}
-	}
-	addr := net.JoinHostPort(p.cfg.Host, strconv.Itoa(port))
-
-	var c *client.Client
-	var err error
-	for attempt := 0; attempt < p.cfg.MaxRetries; attempt++ {
-		if p.cfg.NoSSL {
-			c, err = client.Dial(addr)
-		} else {
-			c, err = client.DialTLS(addr, &tls.Config{ServerName: p.cfg.Host, InsecureSkipVerify: true})
-		}
-		if err == nil {
-			err = c.Login(p.cfg.User, p.cfg.Password)
-		}
-		if err == nil {
-			return c, nil
-		}
-		if attempt < p.cfg.MaxRetries-1 {
-			delay := time.Duration(1<<uint(attempt)) * time.Second
-			if p.cfg.ThrottleDelay > 0 {
-				if d := time.Duration(p.cfg.ThrottleDelay * float64(time.Second)); d > delay {
-					delay = d
-				}
-			}
-			log.Printf("connect attempt %d failed: %v – retry in %v", attempt+1, err, delay)
-			time.Sleep(delay)
-		}
-	}
-	return nil, fmt.Errorf("failed after %d attempts: %w", p.cfg.MaxRetries, err)
-}
-
-// Acquire returns a live connection and a release func.
-func (p *Pool) Acquire() (*client.Client, func(), error) {
-	p.sem <- struct{}{} // blocks until a slot is free
-
-	// Try an idle connection
+func (p *Pool) Acquire() (*imapclient.Client, func(), error) {
+	// Non-blocking check for an available connection.
 	select {
-	case c := <-p.idle:
-		if c.Noop() == nil {
-			return c, func() { p.put(c) }, nil
+	case c := <-p.ch:
+		// Check liveness with Noop.
+		if err := c.Noop().Wait(); err != nil {
+			logVerbose("pooled connection dead, discarding: %v", err)
+			c.Close()
+		} else {
+			release := p.makeRelease(c)
+			return c, release, nil
 		}
-		// Dead — discard and fall through to create a new one
 	default:
 	}
 
-	c, err := p.newConn()
+	// Create a new connection with retries.
+	c, err := newConnWithRetry()
 	if err != nil {
-		<-p.sem
 		return nil, nil, err
 	}
-	if p.cfg.ThrottleDelay > 0 {
-		time.Sleep(time.Duration(p.cfg.ThrottleDelay * float64(time.Second)))
-	}
-	return c, func() { p.put(c) }, nil
+	release := p.makeRelease(c)
+	return c, release, nil
 }
 
-func (p *Pool) put(c *client.Client) {
-	select {
-	case p.idle <- c:
-	default:
-		c.Logout()
+func (p *Pool) makeRelease(c *imapclient.Client) func() {
+	return func() {
+		select {
+		case p.ch <- c:
+			// returned to pool
+		default:
+			// pool full, close connection
+			logVerbose("pool full, closing connection")
+			c.Logout().Wait()
+			c.Close()
+		}
 	}
-	<-p.sem
 }
 
 func (p *Pool) Close() {
 	for {
 		select {
-		case c := <-p.idle:
-			c.Logout()
+		case c := <-p.ch:
+			c.Logout().Wait()
+			c.Close()
 		default:
 			return
 		}
@@ -522,210 +290,555 @@ func (p *Pool) Close() {
 }
 
 // ---------------------------------------------------------------------------
-// IMAP operations
+// Cache (SQLite)
 // ---------------------------------------------------------------------------
 
-const fetchBatch = 200
-
-func setupPool(noCache bool) (*Pool, *Cache) {
-	pool := NewPool(&cfg)
-	var cache *Cache
-	if !noCache {
-		var err error
-		cache, err = NewCache(cfg.CacheDir, cfg.Host, cfg.User)
-		if err != nil {
-			log.Printf("cache unavailable: %v", err)
-		} else if cfg.ClearCache {
-			cache.Clear()
-		}
-	}
-	return pool, cache
+type Cache struct {
+	db  *sql.DB
+	mu  sync.Mutex
+	dir string
 }
 
-func opMailboxes(pool *Pool, cache *Cache) error {
-	if cache != nil {
-		items, err := cache.GetMailboxes()
-		if err == nil && len(items) > 0 {
-			for _, m := range items {
-				emit(m)
-			}
-			return nil
-		}
+func openCache(dir string) (*Cache, error) {
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return nil, fmt.Errorf("create cache dir: %w", err)
 	}
-
-	c, release, err := pool.Acquire()
+	dbPath := filepath.Join(dir, "imap-cache.db")
+	db, err := sql.Open("sqlite3", dbPath)
 	if err != nil {
-		return err
-	}
-	defer release()
-
-	// List all mailboxes
-	mbCh := make(chan *imap.MailboxInfo, 20)
-	done := make(chan error, 1)
-	go func() { done <- c.List("", "*", mbCh) }()
-
-	var infos []*imap.MailboxInfo
-	for mb := range mbCh {
-		infos = append(infos, mb)
-	}
-	if err := <-done; err != nil {
-		return err
+		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
 
-	var results []MailboxObj
-	for _, mb := range infos {
-		obj := MailboxObj{
-			Type:      "mailbox",
-			Name:      mb.Name,
-			Delimiter: mb.Delimiter,
-			Flags:     mb.Attributes,
+	pragmas := []string{
+		"PRAGMA journal_mode=WAL;",
+		"PRAGMA synchronous=NORMAL;",
+	}
+	for _, p := range pragmas {
+		if _, err := db.Exec(p); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("pragma: %w", err)
 		}
-		if obj.Flags == nil {
-			obj.Flags = []string{}
-		}
-
-		st, err := c.Status(mb.Name, []imap.StatusItem{imap.StatusMessages, imap.StatusUnseen})
-		if err == nil {
-			obj.Exists = &st.Messages
-			obj.Unseen = &st.Unseen
-		}
-		results = append(results, obj)
 	}
 
-	if cache != nil {
-		cache.SetMailboxes(results)
+	schema := `
+CREATE TABLE IF NOT EXISTS mailboxes (
+    name TEXT PRIMARY KEY,
+    data TEXT NOT NULL,
+    fetched_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS messages (
+    mailbox TEXT NOT NULL,
+    uid INTEGER NOT NULL,
+    data TEXT NOT NULL,
+    fetched_at TEXT NOT NULL,
+    PRIMARY KEY (mailbox, uid)
+);
+CREATE TABLE IF NOT EXISTS message_content (
+    mailbox TEXT NOT NULL,
+    uid INTEGER NOT NULL,
+    data TEXT NOT NULL,
+    fetched_at TEXT NOT NULL,
+    PRIMARY KEY (mailbox, uid)
+);`
+	if _, err := db.Exec(schema); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("create schema: %w", err)
 	}
-	for _, m := range results {
-		emit(m)
+
+	return &Cache{db: db, dir: dir}, nil
+}
+
+func (c *Cache) Close() {
+	if c.db != nil {
+		c.db.Close()
+	}
+}
+
+func (c *Cache) Clear() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	tables := []string{"mailboxes", "messages", "message_content"}
+	for _, t := range tables {
+		if _, err := c.db.Exec("DELETE FROM " + t); err != nil {
+			return fmt.Errorf("clear %s: %w", t, err)
+		}
 	}
 	return nil
 }
 
-func opMessages(pool *Pool, mailbox string, cache *Cache,
-	limit int, since, before string) error {
-
-	if cache != nil {
-		items, err := cache.GetMessages(mailbox)
-		if err == nil && len(items) > 0 {
-			if limit > 0 && len(items) > limit {
-				items = items[len(items)-limit:]
-			}
-			for _, m := range items {
-				emit(m)
-			}
-			return nil
-		}
+func (c *Cache) GetMailbox(name string) (*MailboxRecord, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var data string
+	err := c.db.QueryRow("SELECT data FROM mailboxes WHERE name=?", name).Scan(&data)
+	if err == sql.ErrNoRows {
+		return nil, nil
 	}
+	if err != nil {
+		return nil, err
+	}
+	var rec MailboxRecord
+	if err := json.Unmarshal([]byte(data), &rec); err != nil {
+		return nil, err
+	}
+	return &rec, nil
+}
 
+func (c *Cache) PutMailbox(rec *MailboxRecord) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	b, err := json.Marshal(rec)
+	if err != nil {
+		return err
+	}
+	_, err = c.db.Exec(
+		"INSERT OR REPLACE INTO mailboxes(name,data,fetched_at) VALUES(?,?,?)",
+		rec.Name, string(b), time.Now().UTC().Format(time.RFC3339),
+	)
+	return err
+}
+
+func (c *Cache) GetMessage(mailbox string, uid uint32) (*MessageRecord, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var data string
+	err := c.db.QueryRow("SELECT data FROM messages WHERE mailbox=? AND uid=?", mailbox, uid).Scan(&data)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var rec MessageRecord
+	if err := json.Unmarshal([]byte(data), &rec); err != nil {
+		return nil, err
+	}
+	return &rec, nil
+}
+
+func (c *Cache) PutMessage(rec *MessageRecord) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	b, err := json.Marshal(rec)
+	if err != nil {
+		return err
+	}
+	_, err = c.db.Exec(
+		"INSERT OR REPLACE INTO messages(mailbox,uid,data,fetched_at) VALUES(?,?,?,?)",
+		rec.Mailbox, rec.UID, string(b), time.Now().UTC().Format(time.RFC3339),
+	)
+	return err
+}
+
+func (c *Cache) GetMessageContent(mailbox string, uid uint32) (*MessageContentRecord, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var data string
+	err := c.db.QueryRow("SELECT data FROM message_content WHERE mailbox=? AND uid=?", mailbox, uid).Scan(&data)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var rec MessageContentRecord
+	if err := json.Unmarshal([]byte(data), &rec); err != nil {
+		return nil, err
+	}
+	return &rec, nil
+}
+
+func (c *Cache) PutMessageContent(rec *MessageContentRecord) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	b, err := json.Marshal(rec)
+	if err != nil {
+		return err
+	}
+	_, err = c.db.Exec(
+		"INSERT OR REPLACE INTO message_content(mailbox,uid,data,fetched_at) VALUES(?,?,?,?)",
+		rec.Mailbox, rec.UID, string(b), time.Now().UTC().Format(time.RFC3339),
+	)
+	return err
+}
+
+// ---------------------------------------------------------------------------
+// Throttle helper
+// ---------------------------------------------------------------------------
+
+func throttle() {
+	if cfg.ThrottleDelay > 0 {
+		time.Sleep(time.Duration(cfg.ThrottleDelay * float64(time.Second)))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Mailboxes command
+// ---------------------------------------------------------------------------
+
+func runMailboxes(pool *Pool, cache *Cache) error {
 	c, release, err := pool.Acquire()
 	if err != nil {
 		return err
 	}
 	defer release()
 
-	if _, err := c.Select(mailbox, true); err != nil {
-		return fmt.Errorf("select %q: %w", mailbox, err)
+	logVerbose("listing mailboxes")
+	listCmd := c.List("", "*", nil)
+	mailboxes, err := listCmd.Collect()
+	if err != nil {
+		return fmt.Errorf("list: %w", err)
 	}
 
-	criteria := imap.NewSearchCriteria()
-	if since != "" {
-		if t, err := parseIMAPDate(since); err == nil {
-			criteria.Since = t
+	for _, mb := range mailboxes {
+		name := mb.Mailbox
+		delim := ""
+		if mb.Delim != 0 {
+			delim = string(mb.Delim)
 		}
+
+		flags := make([]string, 0, len(mb.Attrs))
+		for _, f := range mb.Attrs {
+			flags = append(flags, string(f))
+		}
+
+		rec := &MailboxRecord{
+			Type:      "mailbox",
+			Name:      name,
+			Delimiter: delim,
+			Flags:     flags,
+		}
+
+		// Try cache first (unless --no-cache).
+		if !cfg.NoCache && cache != nil {
+			if cached, err := cache.GetMailbox(name); err == nil && cached != nil {
+				writeJSON(cached)
+				continue
+			}
+		}
+
+		// Fetch status (exists + unseen).
+		throttle()
+		statusData, err := c.Status(name, &imap.StatusOptions{
+			Messages: true,
+			Unseen:   true,
+		}).Wait()
+		if err != nil {
+			logVerbose("status error for %s: %v", name, err)
+		} else {
+			if statusData.Messages != nil {
+				v := int(*statusData.Messages)
+				rec.Exists = &v
+			}
+			if statusData.Unseen != nil {
+				v := int(*statusData.Unseen)
+				rec.Unseen = &v
+			}
+		}
+
+		if !cfg.NoCache && cache != nil {
+			if err := cache.PutMailbox(rec); err != nil {
+				logVerbose("cache put mailbox error: %v", err)
+			}
+		}
+
+		writeJSON(rec)
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Messages command
+// ---------------------------------------------------------------------------
+
+func runMessages(pool *Pool, cache *Cache, mailbox string, limit int, since, before string) error {
+	c, release, err := pool.Acquire()
+	if err != nil {
+		return err
+	}
+	defer release()
+
+	logVerbose("selecting mailbox %s (read-only)", mailbox)
+	_, err = c.Select(mailbox, &imap.SelectOptions{ReadOnly: true}).Wait()
+	if err != nil {
+		return fmt.Errorf("select %s: %w", mailbox, err)
+	}
+
+	criteria := &imap.SearchCriteria{}
+
+	if since != "" {
+		t, err := time.Parse("2006-01-02", since)
+		if err != nil {
+			return fmt.Errorf("invalid --since date: %w", err)
+		}
+		criteria.Since = t
 	}
 	if before != "" {
-		if t, err := parseIMAPDate(before); err == nil {
-			criteria.Before = t
+		t, err := time.Parse("2006-01-02", before)
+		if err != nil {
+			return fmt.Errorf("invalid --before date: %w", err)
 		}
+		criteria.Before = t
 	}
 
-	uids, err := c.UidSearch(criteria)
+	logVerbose("searching messages in %s", mailbox)
+	throttle()
+	searchData, err := c.UIDSearch(criteria, nil).Wait()
 	if err != nil {
-		return fmt.Errorf("search %q: %w", mailbox, err)
+		return fmt.Errorf("search: %w", err)
 	}
-	if len(uids) == 0 {
-		return nil
-	}
+
+	uids := searchData.AllUIDs()
+	logVerbose("found %d UIDs in %s", len(uids), mailbox)
+
+	// Apply limit (take last N = most recent).
 	if limit > 0 && len(uids) > limit {
 		uids = uids[len(uids)-limit:]
 	}
 
-	fetchItems := []imap.FetchItem{imap.FetchEnvelope, imap.FetchFlags, imap.FetchRFC822Size, imap.FetchUid}
-
-	var results []MessageObj
-	for i := 0; i < len(uids); i += fetchBatch {
-		end := i + fetchBatch
+	// Process in batches of 200.
+	const batchSize = 200
+	for i := 0; i < len(uids); i += batchSize {
+		end := i + batchSize
 		if end > len(uids) {
 			end = len(uids)
 		}
 		batch := uids[i:end]
 
-		seqset := new(imap.SeqSet)
-		for _, u := range batch {
-			seqset.AddNum(u)
-		}
-
-		var fetchErr error
-		for attempt := 0; attempt < cfg.MaxRetries; attempt++ {
-			msgCh := make(chan *imap.Message, len(batch))
-			doneCh := make(chan error, 1)
-			go func() { doneCh <- c.UidFetch(seqset, fetchItems, msgCh) }()
-
-			for msg := range msgCh {
-				if msg.Envelope == nil {
+		// Check cache for all UIDs in batch.
+		toFetch := make([]imap.UID, 0, len(batch))
+		for _, uid := range batch {
+			if !cfg.NoCache && cache != nil {
+				cached, err := cache.GetMessage(mailbox, uint32(uid))
+				if err == nil && cached != nil {
+					writeJSON(cached)
 					continue
 				}
-				env := msg.Envelope
-				results = append(results, MessageObj{
-					Type:      "message",
-					Mailbox:   mailbox,
-					UID:       msg.Uid,
-					MessageID: env.MessageId,
-					Subject:   env.Subject,
-					From:      formatAddrs(env.From),
-					To:        formatAddrs(env.To),
-					CC:        formatAddrs(env.Cc),
-					ReplyTo:   formatAddrs(env.ReplyTo),
-					Date:      env.Date.Format(time.RFC3339),
-					Size:      msg.Size,
-					Flags:     msg.Flags,
-				})
 			}
-			fetchErr = <-doneCh
-			if fetchErr == nil {
+			toFetch = append(toFetch, uid)
+		}
+
+		if len(toFetch) == 0 {
+			continue
+		}
+
+		seqSet := imap.UIDSetNum(toFetch...)
+		throttle()
+		fetchCmd := c.Fetch(seqSet, &imap.FetchOptions{
+			UID:       true,
+			Envelope:  true,
+			Flags:     true,
+			RFC822Size: true,
+		})
+
+		for {
+			msg := fetchCmd.Next()
+			if msg == nil {
 				break
 			}
-			if attempt < cfg.MaxRetries-1 {
-				time.Sleep(time.Duration(1<<uint(attempt)) * time.Second)
+
+			rec := &MessageRecord{
+				Type:    "message",
+				Mailbox: mailbox,
+				Flags:   []string{},
+				From:    []string{},
+				To:      []string{},
+				CC:      []string{},
+				ReplyTo: []string{},
 			}
+
+			for {
+				item := msg.Next()
+				if item == nil {
+					break
+				}
+				switch v := item.(type) {
+				case imap.FetchItemDataUID:
+					rec.UID = uint32(v.UID)
+				case imap.FetchItemDataEnvelope:
+					env := v.Envelope
+					rec.Subject = env.Subject
+					rec.Date = formatDate(env.Date)
+					if env.MessageID != "" {
+						rec.MessageID = env.MessageID
+					}
+					rec.From = formatAddrs(env.From)
+					rec.To = formatAddrs(env.To)
+					rec.CC = formatAddrs(env.Cc)
+					rec.ReplyTo = formatAddrs(env.ReplyTo)
+				case imap.FetchItemDataFlags:
+					for _, f := range v.Flags {
+						rec.Flags = append(rec.Flags, string(f))
+					}
+				case imap.FetchItemDataRFC822Size:
+					rec.Size = uint32(v.Size)
+				}
+			}
+
+			if rec.UID == 0 {
+				continue
+			}
+
+			if !cfg.NoCache && cache != nil {
+				if err := cache.PutMessage(rec); err != nil {
+					logVerbose("cache put message error: %v", err)
+				}
+			}
+
+			writeJSON(rec)
 		}
-		if fetchErr != nil {
-			log.Printf("fetch batch error: %v", fetchErr)
+
+		if err := fetchCmd.Close(); err != nil {
+			logVerbose("fetch close error: %v", err)
 		}
 	}
 
-	for i := range results {
-		if results[i].Flags == nil {
-			results[i].Flags = []string{}
-		}
-	}
-
-	if cache != nil && len(results) > 0 {
-		cache.SetMessages(mailbox, results)
-	}
-	for _, m := range results {
-		emit(m)
-	}
 	return nil
 }
 
-func opFetch(pool *Pool, mailbox string, uid uint32,
-	cache *Cache, noAttachments bool) error {
+// ---------------------------------------------------------------------------
+// Body parsing
+// ---------------------------------------------------------------------------
 
-	if cache != nil {
-		obj, err := cache.GetMessageContent(mailbox, uid)
-		if err == nil && obj != nil {
-			emit(obj)
+// decodeHeader decodes a MIME-encoded header value.
+func decodeHeader(s string) string {
+	dec := new(mime.WordDecoder)
+	decoded, err := dec.DecodeHeader(s)
+	if err != nil {
+		return s
+	}
+	return decoded
+}
+
+// readBody reads all bytes from an io.Reader, returning empty on error.
+func readBody(r io.Reader) []byte {
+	b, err := io.ReadAll(r)
+	if err != nil {
+		return nil
+	}
+	return b
+}
+
+// parseBody parses a raw RFC822 message and extracts text/html body parts
+// and attachments.
+func parseBody(raw []byte) (bodyText, bodyHTML string, attachments []Attachment, headers map[string]string) {
+	headers = make(map[string]string)
+	attachments = []Attachment{}
+
+	msg, err := mail.ReadMessage(strings.NewReader(string(raw)))
+	if err != nil {
+		return
+	}
+
+	// Collect headers.
+	for k, vs := range msg.Header {
+		headers[k] = strings.Join(vs, ", ")
+	}
+
+	ct := msg.Header.Get("Content-Type")
+	mediaType, params, err := mime.ParseMediaType(ct)
+	if err != nil {
+		// Treat as plain text.
+		b := readBody(msg.Body)
+		bodyText = string(b)
+		return
+	}
+
+	if strings.HasPrefix(mediaType, "multipart/") {
+		boundary := params["boundary"]
+		bodyText, bodyHTML, attachments = parseMultipart(msg.Body, boundary, mediaType)
+	} else if mediaType == "text/html" {
+		b := readBody(msg.Body)
+		bodyHTML = string(b)
+	} else {
+		b := readBody(msg.Body)
+		bodyText = string(b)
+	}
+	return
+}
+
+func parseMultipart(r io.Reader, boundary, parentMediaType string) (bodyText, bodyHTML string, attachments []Attachment) {
+	attachments = []Attachment{}
+	mr := multipart.NewReader(r, boundary)
+	for {
+		part, err := mr.NextPart()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			break
+		}
+
+		partCT := part.Header.Get("Content-Type")
+		disposition := part.Header.Get("Content-Disposition")
+		contentID := part.Header.Get("Content-Id")
+		contentID = strings.Trim(contentID, "<>")
+
+		partMediaType, partParams, err := mime.ParseMediaType(partCT)
+		if err != nil {
+			part.Close()
+			continue
+		}
+
+		dispType, dispParams, _ := mime.ParseMediaType(disposition)
+
+		isAttachment := dispType == "attachment" || dispType == "inline" && contentID != ""
+
+		if strings.HasPrefix(partMediaType, "multipart/") {
+			subBoundary := partParams["boundary"]
+			subText, subHTML, subAttach := parseMultipart(part, subBoundary, partMediaType)
+			if bodyText == "" {
+				bodyText = subText
+			}
+			if bodyHTML == "" {
+				bodyHTML = subHTML
+			}
+			attachments = append(attachments, subAttach...)
+		} else if partMediaType == "text/plain" && !isAttachment {
+			b := readBody(part)
+			if bodyText == "" {
+				bodyText = string(b)
+			}
+		} else if partMediaType == "text/html" && !isAttachment {
+			b := readBody(part)
+			if bodyHTML == "" {
+				bodyHTML = string(b)
+			}
+		} else {
+			// Treat as attachment.
+			filename := dispParams["filename"]
+			if filename == "" {
+				filename = partParams["name"]
+			}
+			if filename == "" {
+				filename = contentID
+			}
+			b := readBody(part)
+			attachments = append(attachments, Attachment{
+				Filename:    decodeHeader(filename),
+				ContentType: partMediaType,
+				Size:        len(b),
+				ContentID:   contentID,
+			})
+		}
+		part.Close()
+	}
+	return
+}
+
+// ---------------------------------------------------------------------------
+// Fetch command
+// ---------------------------------------------------------------------------
+
+func runFetch(pool *Pool, cache *Cache, mailbox string, uid uint32, noAttachments bool) error {
+	// Try cache first.
+	if !cfg.NoCache && cache != nil {
+		cached, err := cache.GetMessageContent(mailbox, uid)
+		if err == nil && cached != nil {
+			if noAttachments {
+				cached.Attachments = []Attachment{}
+			}
+			writeJSON(cached)
 			return nil
 		}
 	}
@@ -736,284 +849,349 @@ func opFetch(pool *Pool, mailbox string, uid uint32,
 	}
 	defer release()
 
-	if _, err := c.Select(mailbox, true); err != nil {
-		return fmt.Errorf("select %q: %w", mailbox, err)
+	logVerbose("selecting mailbox %s (read-only) for fetch uid=%d", mailbox, uid)
+	_, err = c.Select(mailbox, &imap.SelectOptions{ReadOnly: true}).Wait()
+	if err != nil {
+		return fmt.Errorf("select %s: %w", mailbox, err)
 	}
 
-	section := &imap.BodySectionName{}
-	fetchItems := []imap.FetchItem{
-		imap.FetchEnvelope, imap.FetchFlags, imap.FetchRFC822Size, imap.FetchUid,
-		section.FetchItem(),
+	seqSet := imap.UIDSetNum(imap.UID(uid))
+	throttle()
+
+	fetchCmd := c.Fetch(seqSet, &imap.FetchOptions{
+		UID:      true,
+		Envelope: true,
+		Flags:    true,
+		RFC822Size: true,
+		BodySection: []*imap.FetchItemBodySection{
+			{Specifier: imap.PartSpecifierNone},
+		},
+	})
+
+	rec := &MessageContentRecord{
+		Type:        "message_content",
+		Mailbox:     mailbox,
+		UID:         uid,
+		Flags:       []string{},
+		From:        []string{},
+		To:          []string{},
+		CC:          []string{},
+		ReplyTo:     []string{},
+		Headers:     map[string]string{},
+		Attachments: []Attachment{},
 	}
 
-	seqset := new(imap.SeqSet)
-	seqset.AddNum(uid)
-
-	var fetchErr error
-	for attempt := 0; attempt < cfg.MaxRetries; attempt++ {
-		msgCh := make(chan *imap.Message, 1)
-		doneCh := make(chan error, 1)
-		go func() { doneCh <- c.UidFetch(seqset, fetchItems, msgCh) }()
-
-		for msg := range msgCh {
-			if msg.Envelope == nil {
-				continue
-			}
-			env := msg.Envelope
-
-			var rawBody []byte
-			if r := msg.GetBody(section); r != nil {
-				rawBody, _ = io.ReadAll(r)
-			}
-
-			bodyText, bodyHTML, atts, hdrs := parseBodyBytes(rawBody)
-			if noAttachments {
-				atts = []Attachment{}
-			}
-			flags := msg.Flags
-			if flags == nil {
-				flags = []string{}
-			}
-
-			obj := &MessageContentObj{
-				Type:        "message_content",
-				Mailbox:     mailbox,
-				UID:         msg.Uid,
-				MessageID:   env.MessageId,
-				Subject:     env.Subject,
-				From:        formatAddrs(env.From),
-				To:          formatAddrs(env.To),
-				CC:          formatAddrs(env.Cc),
-				ReplyTo:     formatAddrs(env.ReplyTo),
-				Date:        env.Date.Format(time.RFC3339),
-				Size:        msg.Size,
-				Flags:       flags,
-				Headers:     hdrs,
-				BodyText:    bodyText,
-				BodyHTML:    bodyHTML,
-				Attachments: atts,
-			}
-			if cache != nil {
-				cache.SetMessageContent(mailbox, uid, obj)
-			}
-			emit(obj)
-		}
-		fetchErr = <-doneCh
-		if fetchErr == nil {
+	for {
+		msg := fetchCmd.Next()
+		if msg == nil {
 			break
 		}
-		if attempt < cfg.MaxRetries-1 {
-			time.Sleep(time.Duration(1<<uint(attempt)) * time.Second)
-		}
-	}
-	return fetchErr
-}
 
-// ---------------------------------------------------------------------------
-// Command runners
-// ---------------------------------------------------------------------------
+		var rawBody []byte
 
-func runMailboxes(cmd *cobra.Command, args []string) error {
-	pool, cache := setupPool(cfg.NoCache)
-	defer pool.Close()
-	if cache != nil {
-		defer cache.Close()
-	}
-	return opMailboxes(pool, cache)
-}
-
-func runMessages(cmd *cobra.Command, args []string) error {
-	mailbox, _ := cmd.Flags().GetString("mailbox")
-	limit, _ := cmd.Flags().GetInt("limit")
-	since, _ := cmd.Flags().GetString("since")
-	before, _ := cmd.Flags().GetString("before")
-
-	pool, cache := setupPool(cfg.NoCache)
-	defer pool.Close()
-	if cache != nil {
-		defer cache.Close()
-	}
-
-	process := func(mb string) {
-		if err := opMessages(pool, mb, cache, limit, since, before); err != nil {
-			emitErr(err.Error())
-		}
-	}
-
-	if isPipe() {
-		taskCh := make(chan string, cfg.PoolSize*2)
-		var wg sync.WaitGroup
-		for i := 0; i < cfg.PoolSize; i++ {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				for mb := range taskCh {
-					process(mb)
-				}
-			}()
-		}
-		scanJSONLines(func(obj map[string]interface{}) {
-			if t, _ := obj["type"].(string); t == "mailbox" {
-				if name, _ := obj["name"].(string); name != "" {
-					taskCh <- name
-				}
+		for {
+			item := msg.Next()
+			if item == nil {
+				break
 			}
-		})
-		close(taskCh)
-		wg.Wait()
-	} else if mailbox != "" {
-		process(mailbox)
-	} else {
-		emitErr("provide --mailbox or pipe mailbox JSON Lines from stdin")
-	}
-	return nil
-}
-
-func runFetch(cmd *cobra.Command, args []string) error {
-	mailbox, _ := cmd.Flags().GetString("mailbox")
-	uid, _ := cmd.Flags().GetUint32("uid")
-	noAtt, _ := cmd.Flags().GetBool("no-attachments")
-
-	pool, cache := setupPool(cfg.NoCache)
-	defer pool.Close()
-	if cache != nil {
-		defer cache.Close()
-	}
-
-	type task struct {
-		mailbox string
-		uid     uint32
-	}
-	process := func(t task) {
-		if err := opFetch(pool, t.mailbox, t.uid, cache, noAtt); err != nil {
-			emitErr(err.Error())
-		}
-	}
-
-	if isPipe() {
-		taskCh := make(chan task, cfg.PoolSize*2)
-		var wg sync.WaitGroup
-		for i := 0; i < cfg.PoolSize; i++ {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				for t := range taskCh {
-					process(t)
+			switch v := item.(type) {
+			case imap.FetchItemDataUID:
+				rec.UID = uint32(v.UID)
+			case imap.FetchItemDataEnvelope:
+				env := v.Envelope
+				rec.Subject = env.Subject
+				rec.Date = formatDate(env.Date)
+				if env.MessageID != "" {
+					rec.MessageID = env.MessageID
 				}
-			}()
-		}
-		scanJSONLines(func(obj map[string]interface{}) {
-			if tp, _ := obj["type"].(string); tp == "message" {
-				mb, _ := obj["mailbox"].(string)
-				u, _ := obj["uid"].(float64)
-				if mb != "" && u > 0 {
-					taskCh <- task{mb, uint32(u)}
+				rec.From = formatAddrs(env.From)
+				rec.To = formatAddrs(env.To)
+				rec.CC = formatAddrs(env.Cc)
+				rec.ReplyTo = formatAddrs(env.ReplyTo)
+			case imap.FetchItemDataFlags:
+				for _, f := range v.Flags {
+					rec.Flags = append(rec.Flags, string(f))
 				}
+			case imap.FetchItemDataRFC822Size:
+				rec.Size = uint32(v.Size)
+			case imap.FetchItemDataBodySection:
+				rawBody = readBody(v.Literal)
 			}
-		})
-		close(taskCh)
-		wg.Wait()
-	} else if mailbox != "" && uid > 0 {
-		process(task{mailbox, uid})
-	} else {
-		emitErr("provide --mailbox + --uid or pipe message JSON Lines from stdin")
+		}
+
+		if len(rawBody) > 0 {
+			bodyText, bodyHTML, attachments, headers := parseBody(rawBody)
+			rec.BodyText = bodyText
+			rec.BodyHTML = bodyHTML
+			rec.Attachments = attachments
+			rec.Headers = headers
+		}
 	}
+
+	if err := fetchCmd.Close(); err != nil {
+		logVerbose("fetch close error: %v", err)
+	}
+
+	if noAttachments {
+		rec.Attachments = []Attachment{}
+	}
+
+	if !cfg.NoCache && cache != nil {
+		if err := cache.PutMessageContent(rec); err != nil {
+			logVerbose("cache put message_content error: %v", err)
+		}
+	}
+
+	writeJSON(rec)
 	return nil
 }
 
 // ---------------------------------------------------------------------------
-// Stdin helpers
+// stdin pipeline dispatcher
 // ---------------------------------------------------------------------------
 
-func isPipe() bool {
-	stat, _ := os.Stdin.Stat()
+// isStdinPipe returns true when stdin is a pipe (not a terminal).
+func isStdinPipe() bool {
+	stat, err := os.Stdin.Stat()
+	if err != nil {
+		return false
+	}
 	return (stat.Mode() & os.ModeCharDevice) == 0
 }
 
-func scanJSONLines(fn func(map[string]interface{})) {
+type stdinMailboxLine struct {
+	Mailbox string `json:"mailbox"`
+	UID     *uint32 `json:"uid"`
+}
+
+// dispatchFromStdin reads JSON Lines from stdin and dispatches work using a
+// goroutine worker pool of pool.PoolSize workers.
+func dispatchFromStdin(pool *Pool, cache *Cache, workerFn func(line stdinMailboxLine) error) {
+	jobs := make(chan stdinMailboxLine, cfg.PoolSize*2)
+	var wg sync.WaitGroup
+
+	for i := 0; i < cfg.PoolSize; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for job := range jobs {
+				if err := workerFn(job); err != nil {
+					writeError(fmt.Sprintf("worker error: %v", err))
+				}
+			}
+		}()
+	}
+
 	scanner := bufio.NewScanner(os.Stdin)
-	scanner.Buffer(make([]byte, 10*1024*1024), 10*1024*1024)
 	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
+		line := scanner.Text()
+		if strings.TrimSpace(line) == "" {
 			continue
 		}
-		var obj map[string]interface{}
-		if json.Unmarshal([]byte(line), &obj) == nil {
-			fn(obj)
+		var parsed stdinMailboxLine
+		if err := json.Unmarshal([]byte(line), &parsed); err != nil {
+			writeError(fmt.Sprintf("invalid stdin JSON: %v", err))
+			continue
 		}
+		jobs <- parsed
 	}
+	close(jobs)
+	wg.Wait()
 }
 
 // ---------------------------------------------------------------------------
-// CLI setup
+// Default cache dir
+// ---------------------------------------------------------------------------
+
+func defaultCacheDir() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ".imap-cache"
+	}
+	return filepath.Join(home, ".imap-cache")
+}
+
+// ---------------------------------------------------------------------------
+// main / cobra setup
 // ---------------------------------------------------------------------------
 
 func main() {
-	root := &cobra.Command{
-		Use:          "imap-cli",
-		Short:        "Universal IMAP client \u2014 outputs JSON Lines",
-		SilenceUsage: true,
+	rootCmd := &cobra.Command{
+		Use:   "imap-cli",
+		Short: "IMAP command-line client",
 		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
-			if !cfg.Verbose {
-				log.SetOutput(io.Discard)
+			// Validate required flags.
+			if cfg.Host == "" {
+				return fmt.Errorf("--host is required")
+			}
+			if cfg.User == "" {
+				return fmt.Errorf("--user is required")
+			}
+			if cfg.Password == "" {
+				return fmt.Errorf("--password is required")
+			}
+			if cfg.PoolSize < 1 {
+				cfg.PoolSize = 1
+			}
+			if cfg.MaxRetries < 1 {
+				cfg.MaxRetries = 1
 			}
 			return nil
 		},
 	}
 
-	pf := root.PersistentFlags()
-	pf.StringVar(&cfg.Host, "host", "", "IMAP hostname (required)")
-	pf.IntVar(&cfg.Port, "port", 0, "IMAP port (0=auto: 993 TLS / 143 plain)")
-	pf.StringVar(&cfg.User, "user", "", "Username (required)")
-	pf.StringVar(&cfg.Password, "password", "", "Password (required)")
-	pf.BoolVar(&cfg.NoSSL, "no-ssl", false, "Disable TLS")
+	// Global persistent flags.
+	pf := rootCmd.PersistentFlags()
+	pf.StringVar(&cfg.Host, "host", "", "IMAP server hostname (required)")
+	pf.IntVar(&cfg.Port, "port", 0, "IMAP server port (0 = auto: 993 TLS / 143 plain)")
+	pf.StringVar(&cfg.User, "user", "", "IMAP username (required)")
+	pf.StringVar(&cfg.Password, "password", "", "IMAP password (required)")
+	pf.BoolVar(&cfg.NoSSL, "no-ssl", false, "Disable TLS/SSL (use plain IMAP)")
 	pf.IntVar(&cfg.PoolSize, "pool-size", 5, "Connection pool size")
-	pf.Float64Var(&cfg.ThrottleDelay, "throttle-delay", 0, "Seconds between requests")
-	pf.IntVar(&cfg.MaxRetries, "max-retries", 3, "Max retries on failure")
-
-	home, _ := os.UserHomeDir()
-	pf.StringVar(&cfg.CacheDir, "cache-dir", filepath.Join(home, ".imap-cache"), "Cache directory")
-	pf.BoolVar(&cfg.NoCache, "no-cache", false, "Bypass cache")
+	pf.Float64Var(&cfg.ThrottleDelay, "throttle-delay", 0, "Delay in seconds between IMAP operations")
+	pf.IntVar(&cfg.MaxRetries, "max-retries", 3, "Maximum connection retry attempts")
+	pf.StringVar(&cfg.CacheDir, "cache-dir", defaultCacheDir(), "Directory for SQLite cache")
+	pf.BoolVar(&cfg.NoCache, "no-cache", false, "Disable caching")
 	pf.BoolVar(&cfg.ClearCache, "clear-cache", false, "Clear cache before running")
-	pf.BoolVarP(&cfg.Verbose, "verbose", "v", false, "Verbose logging")
+	pf.BoolVar(&cfg.Verbose, "verbose", false, "Enable verbose logging to stderr")
 
-	root.MarkPersistentFlagRequired("host")
-	root.MarkPersistentFlagRequired("user")
-	root.MarkPersistentFlagRequired("password")
-
-	// mailboxes
-	root.AddCommand(&cobra.Command{
+	// ---- mailboxes command ----
+	mailboxesCmd := &cobra.Command{
 		Use:   "mailboxes",
-		Short: "List all mailboxes/folders",
-		RunE:  runMailboxes,
-	})
+		Short: "List all mailboxes",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			pool := NewPool(cfg, cfg.PoolSize)
+			defer pool.Close()
 
-	// messages
-	msgsCmd := &cobra.Command{
-		Use:   "messages",
-		Short: "List messages (reads mailbox jsonl from stdin or --mailbox)",
-		RunE:  runMessages,
+			var cache *Cache
+			if !cfg.NoCache {
+				var err error
+				cache, err = openCache(cfg.CacheDir)
+				if err != nil {
+					logVerbose("failed to open cache: %v", err)
+				} else {
+					defer cache.Close()
+					if cfg.ClearCache {
+						if err := cache.Clear(); err != nil {
+							logVerbose("clear cache error: %v", err)
+						}
+					}
+				}
+			}
+
+			return runMailboxes(pool, cache)
+		},
 	}
-	msgsCmd.Flags().StringP("mailbox", "m", "", "Mailbox name")
-	msgsCmd.Flags().IntP("limit", "n", 0, "Max messages (0=all)")
-	msgsCmd.Flags().String("since", "", "Messages since date (e.g. 01-Jan-2024)")
-	msgsCmd.Flags().String("before", "", "Messages before date")
-	root.AddCommand(msgsCmd)
 
-	// fetch
+	// ---- messages command ----
+	var (
+		msgMailbox string
+		msgLimit   int
+		msgSince   string
+		msgBefore  string
+	)
+	messagesCmd := &cobra.Command{
+		Use:   "messages",
+		Short: "List messages in a mailbox",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			pool := NewPool(cfg, cfg.PoolSize)
+			defer pool.Close()
+
+			var cache *Cache
+			if !cfg.NoCache {
+				var err error
+				cache, err = openCache(cfg.CacheDir)
+				if err != nil {
+					logVerbose("failed to open cache: %v", err)
+				} else {
+					defer cache.Close()
+					if cfg.ClearCache {
+						if err := cache.Clear(); err != nil {
+							logVerbose("clear cache error: %v", err)
+						}
+					}
+				}
+			}
+
+			// Pipeline mode: read mailboxes from stdin.
+			if isStdinPipe() && msgMailbox == "" {
+				dispatchFromStdin(pool, cache, func(line stdinMailboxLine) error {
+					if line.Mailbox == "" {
+						return fmt.Errorf("stdin line missing 'mailbox' field")
+					}
+					return runMessages(pool, cache, line.Mailbox, msgLimit, msgSince, msgBefore)
+				})
+				return nil
+			}
+
+			if msgMailbox == "" {
+				return fmt.Errorf("--mailbox is required (or pipe mailbox names via stdin)")
+			}
+			return runMessages(pool, cache, msgMailbox, msgLimit, msgSince, msgBefore)
+		},
+	}
+	messagesCmd.Flags().StringVarP(&msgMailbox, "mailbox", "m", "", "Mailbox name")
+	messagesCmd.Flags().IntVarP(&msgLimit, "limit", "n", 0, "Maximum number of messages to return (0 = all)")
+	messagesCmd.Flags().StringVar(&msgSince, "since", "", "Return messages since this date (YYYY-MM-DD)")
+	messagesCmd.Flags().StringVar(&msgBefore, "before", "", "Return messages before this date (YYYY-MM-DD)")
+
+	// ---- fetch command ----
+	var (
+		fetchMailbox      string
+		fetchUID          uint32
+		fetchNoAttachments bool
+	)
 	fetchCmd := &cobra.Command{
 		Use:   "fetch",
-		Short: "Fetch full message content (reads message jsonl from stdin or --mailbox+--uid)",
-		RunE:  runFetch,
-	}
-	fetchCmd.Flags().StringP("mailbox", "m", "", "Mailbox name")
-	fetchCmd.Flags().Uint32P("uid", "u", 0, "Message UID")
-	fetchCmd.Flags().Bool("no-attachments", false, "Omit attachment bodies")
-	root.AddCommand(fetchCmd)
+		Short: "Fetch full message content",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			pool := NewPool(cfg, cfg.PoolSize)
+			defer pool.Close()
 
-	if err := root.Execute(); err != nil {
-		emitErr(err.Error())
+			var cache *Cache
+			if !cfg.NoCache {
+				var err error
+				cache, err = openCache(cfg.CacheDir)
+				if err != nil {
+					logVerbose("failed to open cache: %v", err)
+				} else {
+					defer cache.Close()
+					if cfg.ClearCache {
+						if err := cache.Clear(); err != nil {
+							logVerbose("clear cache error: %v", err)
+						}
+					}
+				}
+			}
+
+			// Pipeline mode: read mailbox+uid pairs from stdin.
+			if isStdinPipe() && (fetchMailbox == "" || fetchUID == 0) {
+				dispatchFromStdin(pool, cache, func(line stdinMailboxLine) error {
+					if line.Mailbox == "" || line.UID == nil {
+						return fmt.Errorf("stdin line missing 'mailbox' or 'uid' field")
+					}
+					return runFetch(pool, cache, line.Mailbox, *line.UID, fetchNoAttachments)
+				})
+				return nil
+			}
+
+			if fetchMailbox == "" {
+				return fmt.Errorf("--mailbox is required")
+			}
+			if fetchUID == 0 {
+				return fmt.Errorf("--uid is required")
+			}
+			return runFetch(pool, cache, fetchMailbox, fetchUID, fetchNoAttachments)
+		},
+	}
+	fetchCmd.Flags().StringVarP(&fetchMailbox, "mailbox", "m", "", "Mailbox name")
+	fetchCmd.Flags().Uint32VarP(&fetchUID, "uid", "u", 0, "Message UID")
+	fetchCmd.Flags().BoolVar(&fetchNoAttachments, "no-attachments", false, "Exclude attachment content")
+
+	rootCmd.AddCommand(mailboxesCmd, messagesCmd, fetchCmd)
+
+	if err := rootCmd.Execute(); err != nil {
+		writeError(err.Error())
 		os.Exit(1)
 	}
 }
