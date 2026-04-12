@@ -1,0 +1,14 @@
+{
+  "name": "imap-cli-js",
+  "version": "1.0.0",
+  "description": "Universal IMAP client CLI (Node.js)",
+  "type": "module",
+  "bin": { "imap-cli": "./src/index.js" },
+  "scripts": { "start": "node src/index.js" },
+  "dependencies": {
+    "better-sqlite3": "^9.4.3",
+    "commander": "^12.0.0",
+    "imapflow": "^1.0.162",
+    "mailparser": "^3.7.0"
+  }
+}

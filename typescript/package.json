@@ -1,0 +1,29 @@
+{
+  "name": "imap-cli",
+  "version": "1.0.0",
+  "description": "Production-quality IMAP CLI tool with connection pooling and SQLite caching",
+  "main": "dist/index.js",
+  "bin": {
+    "imap-cli": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "ts-node src/index.ts"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "better-sqlite3": "^9.0.0",
+    "commander": "^12.0.0",
+    "imapflow": "^1.0.0",
+    "mailparser": "^3.0.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.0",
+    "@types/node": "^20.0.0",
+    "ts-node": "^10.9.0",
+    "typescript": "^5.0.0"
+  }
+}
