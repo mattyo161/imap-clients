@@ -834,6 +834,121 @@ def op_fetch(pool: ConnectionPool, mailbox: str, uid: int,
     return obj
 
 
+def op_fetch_batch(
+    pool: ConnectionPool,
+    mailbox: str,
+    uids: List[int],
+    cache: Optional[Cache],
+    no_cache: bool,
+    no_attachments: bool,
+) -> Tuple[List[Dict], int]:
+    """
+    Fetch multiple full messages from one mailbox in a single IMAP FETCH call.
+
+    Cache hits are resolved locally first; only the uncached UIDs hit the
+    network.  All results are cached individually after the batch fetch.
+
+    Returns (results, cache_hit_count).
+    """
+    results: List[Dict] = []
+    uncached: List[int] = []
+
+    for uid in uids:
+        if not no_cache and cache:
+            cached_obj = cache.get_message_content(mailbox, uid)
+            if cached_obj is not None:
+                # log.debug("fetch_batch: cache hit %s/%d", mailbox, uid)
+                results.append(cached_obj)
+                continue
+        uncached.append(uid)
+
+    cache_hits = len(uids) - len(uncached)
+
+    if not uncached:
+        return results, cache_hits  # every UID was a cache hit — no network needed
+
+    data: Optional[Dict] = None
+    last_exc: Optional[Exception] = None
+
+    for attempt in range(pool.max_retries):
+        try:
+            with pool.acquire() as conn:
+                conn.select_folder(mailbox, readonly=True)
+                fetch_props = [
+                    "ENVELOPE", "FLAGS", "RFC822.SIZE", "INTERNALDATE", "RFC822",
+                    *conn._additional_fetch_properties,
+                ]
+                log.debug("fetch_batch: fetching %d uids from %s", len(uncached), mailbox)
+                data = conn.fetch(uncached, fetch_props)
+            pool.on_success()
+            break
+        except Exception as exc:
+            last_exc = exc
+            data = None
+            delay = 5 * (2 ** attempt)
+            pool.on_throttle(delay)
+            if attempt < pool.max_retries - 1:
+                if _progress:
+                    _progress.start_pause()
+                try:
+                    emit_pause(delay, api="fetch", mailbox=mailbox,
+                               attempt=attempt + 1, error=str(exc))
+                finally:
+                    if _progress:
+                        _progress.end_pause()
+    else:
+        emit_err(str(last_exc), api="fetch", mailbox=mailbox,
+                 error_code=_imap_error_code(last_exc), failed=True)
+        return results, cache_hits
+
+    if data is None:
+        return results, cache_hits
+
+    for uid in uncached:
+        if uid not in data:
+            continue
+        item = data[uid]
+        env_raw = item.get(b"ENVELOPE")
+        if env_raw is None:
+            continue
+        env = parse_envelope(env_raw)
+        internal_date_raw = item.get(b"INTERNALDATE")
+        raw = item.get(b"RFC822", b"")
+        body_text, body_html, atts = parse_body(raw)
+        hdrs = parse_headers(raw)
+
+        obj: Dict = {
+            "type": "message_content",
+            "mailbox": mailbox,
+            "uid": uid,
+            **env,
+            "internal_date": parse_date(internal_date_raw) if internal_date_raw else "",
+            "size": item.get(b"RFC822.SIZE", 0),
+            "flags": flags_to_list(item.get(b"FLAGS", [])),
+            "headers": hdrs,
+            "body_text": body_text,
+            "body_html": body_html,
+            "attachments": [] if no_attachments else atts,
+        }
+
+        for prop in [b"X-GM-LABELS", b"X-GM-MSGID", b"X-GM-THRID"]:
+            if prop in item:
+                value = item.get(prop)
+                if value is None:
+                    continue
+                if isinstance(value, (list, tuple)):
+                    value = [l if isinstance(l, str) else l.decode("utf-8") for l in value]
+                elif isinstance(value, bytes):
+                    value = value.decode("utf-8")
+                obj[prop.decode("utf-8")] = value
+
+        if cache:
+            cache.set_message_content(mailbox, uid, obj)
+        results.append(obj)
+
+    return results, cache_hits
+
+
 # ---------------------------------------------------------------------------
 # Output helpers
 # ---------------------------------------------------------------------------
@@ -865,35 +980,17 @@ def _fmt_elapsed(seconds: float) -> str:
     return f"{s:.1f}s"
 
 
-# Short display name for each subcommand (shown in the progress line).
-_CMD_LABEL: Dict[str, str] = {
-    "mailboxes": "mailbox",
-    "messages":  "message",
-    "fetch":     "fetch",
-}
-
-
 class Progress:
     """
     Live, multi-process-aware progress display rendered to stderr.
 
-    When stderr is a TTY and multiple imap-cli processes share the same
-    process group (i.e. a pipeline), each gets its own row that updates
-    in place.  Processes coordinate via a shared temp file keyed on the
-    process-group ID so they never overwrite each other's lines.
+    Stats from all processes in the pipeline are aggregated by command type
+    and rendered as a single updating line:
 
-    Example (three-stage pipeline, mid-run):
+        mailboxes(c: 10, s: 20)  messages(s: 68000, q: 120000)  fetch(s: 68000, q: 120000, f: 100)
 
-        \\ pid(123) -- 3m19.2s  mailbox  requests=40  active=0  queue=0   cached=0  avg=0.512s/req
-        - pid(124) -- 3m19.7s  message  requests=40  active=5  queue=10  cached=0  avg=7.449s/req
-        \\ pid(125) -- 3m21.8s  fetch    requests=1941 active=5 queue=57143 cached=0 avg=0.513s/req
-
-    When a process finishes its line is frozen as COMPLETE:
-
-        COMPLETE pid(123) -- 4m19.2s  mailbox  requests=40  ...
-
-    Single-process use (no pipeline) renders a single line, same as before
-    except for the added pid(...) prefix.
+    c=cached  s=success  q=queued/in-flight  f=failed
+    c, q, f are omitted when zero.
 
     Thread-safety: internal stats are protected by self._lock.
     Cross-process writes to stderr are serialised by _output_lock (same
@@ -908,12 +1005,11 @@ class Progress:
         self._cmd_name = cmd_name
         self._pid = os.getpid()
         self._lock = threading.Lock()
-        self._start = time.monotonic()
-        self._requests_done: int = 0   # IMAP requests completed (cache misses)
+        self._requests_done: int = 0   # items fetched from network
         self._cache_hits: int = 0      # items served from cache
         self._active: int = 0          # items currently being processed
         self._queue_size: int = 0      # items submitted but not yet started
-        self._total_time: float = 0.0  # wall time for IMAP requests only
+        self._total_time: float = 0.0  # wall time for network requests only
         self._errors: int = 0          # total error events emitted
         self._failed: int = 0          # requests that exhausted all retries
         self._paused: int = 0          # threads currently sleeping in backoff
@@ -921,9 +1017,7 @@ class Progress:
         self._running: bool = False
         self._tty: bool = sys.stderr.isatty()
         self._thread: Optional[threading.Thread] = None
-        # Lines currently drawn on screen — kept consistent under _output_lock
-        # so that clear_line() (also called under _output_lock) always knows
-        # how many lines to erase.
+        # 0 or 1 — kept consistent under _output_lock so clear_line() is correct
         self._screen_lines: int = 0
         # Paths to coordination files (populated in _setup_coord)
         self._coord_path: str = ""
@@ -943,13 +1037,18 @@ class Progress:
         self._lock_path  = os.path.join(_PROGRESS_DIR, f"{pgid}.lock")
         with self._flock():
             data = self._read_coord()
+            if "pipeline_start" not in data:
+                data["pipeline_start"] = time.time()
             self._slot = len(data["slots"])
             data["slots"].append({
-                "pid":  self._pid,
-                "slot": self._slot,
-                "cmd":  self._cmd_name,
-                "done": False,
-                "line": "",
+                "pid":     self._pid,
+                "slot":    self._slot,
+                "cmd":     self._cmd_name,
+                "done":    False,
+                "cached":  0,
+                "success": 0,
+                "queued":  0,
+                "failed":  0,
             })
             self._write_coord(data)
 
@@ -963,38 +1062,41 @@ class Progress:
         self._thread.start()
 
     def stop(self) -> None:
-        """Stop rendering and freeze this process's line as COMPLETE."""
+        """Stop rendering and write the final consolidated progress line."""
         self._running = False
         if self._thread:
             self._thread.join(timeout=0.5)
         if not self._tty:
             return
 
-        final_line = self._build_line(done=True)
+        with self._lock:
+            cached  = self._cache_hits
+            success = self._requests_done
+            failed  = self._failed
 
-        # Hold coord lock while doing the final write so no other process
-        # can reposition the cursor in between.
         with self._flock():
             data = self._read_coord()
+            elapsed_s = time.time() - data.get("pipeline_start", time.time())
             for s in data["slots"]:
                 if s["slot"] == self._slot:
-                    s["done"] = True
-                    s["line"] = final_line
+                    s["done"]    = True
+                    s["cached"]  = cached
+                    s["success"] = success
+                    s["queued"]  = 0   # done — nothing queued or in-flight
+                    s["failed"]  = failed
                     break
             old_screen = data["screen_lines"]
-            n = len(data["slots"])
-            render_str = self._build_render_str(data["slots"], old_screen, n)
+            render_str = self._build_render_str(data["slots"], old_screen, elapsed_s, "-")
             all_done = all(s["done"] for s in data["slots"])
-            data["screen_lines"] = n
+            data["screen_lines"] = 1
             self._write_coord(data)
 
             with _output_lock:
                 sys.stderr.write(render_str)
                 if all_done:
-                    # Leave cursor on a fresh line so the shell prompt appears below.
                     sys.stderr.write("\n")
                 sys.stderr.flush()
-                self._screen_lines = 0 if all_done else n
+                self._screen_lines = 0 if all_done else 1
 
         if all_done:
             with contextlib.suppress(OSError):
@@ -1009,24 +1111,27 @@ class Progress:
         with self._lock:
             self._queue_size += n
 
-    def start_call(self) -> None:
-        """Called at the start of each worker: moves one item queue→active."""
+    def start_call(self, n: int = 1) -> None:
+        """Called at the start of each worker: moves n items queue→active."""
         with self._lock:
-            self._queue_size = max(0, self._queue_size - 1)
-            self._active += 1
+            self._queue_size = max(0, self._queue_size - n)
+            self._active += n
 
-    def finish_call(self, elapsed: float, *, cached: bool) -> None:
+    def finish_call(
+        self, elapsed: float, *, cached_count: int = 0, success_count: int = 1
+    ) -> None:
         """
         Called at the end of each worker.
-        cached=True  → increments cache_hits; elapsed excluded from avg.
-        cached=False → increments requests_done; elapsed included in avg.
+        cached_count:  items served from cache (elapsed excluded from avg).
+        success_count: items fetched from the network (elapsed included in avg).
+        Both may be non-zero for batch fetches with mixed cache/network results.
         """
+        total = cached_count + success_count
         with self._lock:
-            self._active = max(0, self._active - 1)
-            if cached:
-                self._cache_hits += 1
-            else:
-                self._requests_done += 1
+            self._active = max(0, self._active - total)
+            self._cache_hits += cached_count
+            self._requests_done += success_count
+            if success_count:
                 self._total_time += elapsed
 
     def record_error(self, *, failed: bool = False) -> None:
@@ -1056,29 +1161,11 @@ class Progress:
 
     def clear_line(self) -> None:
         """
-        Erase all progress lines and reposition cursor at the start of the
-        first progress line.  MUST be called while _output_lock is held.
-
-        After this call _screen_lines is 0 and the cursor sits at column 0
-        of the line where the top progress row was.  The caller may write an
-        error/pause line there; the next render cycle will append the
-        progress block below it.
+        Erase the single progress line.  MUST be called while _output_lock is held.
         """
-        if not self._tty or not self._running:
+        if not self._tty or not self._running or self._screen_lines == 0:
             return
-        n = self._screen_lines  # safe: we hold _output_lock which also guards this
-        if n == 0:
-            return
-        if n > 1:
-            sys.stderr.write(f"\033[{n - 1}A")   # cursor to first progress line
-        sys.stderr.write("\r")
-        for i in range(n):
-            sys.stderr.write("\033[2K")           # clear current line
-            if i < n - 1:
-                sys.stderr.write("\n")
-        if n > 1:
-            sys.stderr.write(f"\033[{n - 1}A")   # back to first line
-        sys.stderr.write("\r")
+        sys.stderr.write("\r\033[2K")
         self._screen_lines = 0
 
     # -- internal ------------------------------------------------------------
@@ -1114,93 +1201,96 @@ class Progress:
             self._render()
             time.sleep(0.1)
 
-    def _build_line(self, *, done: bool = False) -> str:
-        """Build the formatted progress string for this process."""
-        with self._lock:
-            elapsed_s  = time.monotonic() - self._start
-            done_reqs  = self._requests_done
-            cached     = self._cache_hits
-            active     = self._active
-            paused     = self._paused
-            queue      = self._queue_size
-            total      = self._total_time
-            errors     = self._errors
-            failed     = self._failed
-            if not done:
-                ch = self._SPINNERS[self._spinner_idx % len(self._SPINNERS)]
-                self._spinner_idx += 1
-            else:
-                ch = None
+    @staticmethod
+    def _build_consolidated_line(
+        slots: list, elapsed_s: float, spinner_ch: str
+    ) -> str:
+        """
+        Build a single progress line combining the spinner/elapsed/totals prefix
+        with per-command-type stats aggregated across all pipeline slots:
 
-        avg = total / done_reqs if done_reqs else 0.0
-        elapsed_str = _fmt_elapsed(elapsed_s)
-        prefix = f"COMPLETE pid({self._pid}) -- " if done else f"{ch} pid({self._pid}) -- "
+            \ 3m19.2s  requests=2041  errors=5  mailboxes(c: 10, s: 20, rps: 1.2)  messages(s: 68000, q: 120000, rps: 45.3)  fetch(s: 68000, q: 120000, f: 100, rps: 23.1)
 
-        line = (
-            f"{prefix}{elapsed_str}  {self._cmd_name}"
-            f"  requests={done_reqs}"
-            f"  active={active}"
-        )
-        if paused:
-            line += f"  paused={paused}"
-        line += (
-            f"  queue={queue}"
-            f"  cached={cached}"
-            f"  avg={avg:.3f}s/req"
-        )
-        if errors:
-            line += f"  errors={errors}"
-            if failed:
-                line += f"  failed={failed}"
+        c=cached  s=success  q=queued/in-flight  f=failed  rps=messages/sec
+        c, q, f are omitted when zero.
+        """
+        total_requests = sum(s.get("success", 0) for s in slots)
+        total_errors   = sum(s.get("failed",  0) for s in slots)
+
+        line = f"{spinner_ch} {_fmt_elapsed(elapsed_s)}  requests={total_requests}"
+        if total_errors:
+            line += f"  errors={total_errors}"
+
+        by_cmd: Dict[str, Dict[str, int]] = {}
+        for s in slots:
+            cmd = s.get("cmd", "")
+            if cmd not in by_cmd:
+                by_cmd[cmd] = {"cached": 0, "success": 0, "queued": 0, "failed": 0}
+            by_cmd[cmd]["cached"]  += s.get("cached",  0)
+            by_cmd[cmd]["success"] += s.get("success", 0)
+            by_cmd[cmd]["queued"]  += s.get("queued",  0)
+            by_cmd[cmd]["failed"]  += s.get("failed",  0)
+
+        parts: List[str] = []
+        for cmd in ("mailboxes", "messages", "fetch"):
+            if cmd not in by_cmd:
+                continue
+            st = by_cmd[cmd]
+            total_done = st["cached"] + st["success"]
+            inner: List[str] = []
+            if st["cached"]:
+                inner.append(f"c: {st['cached']}")
+            inner.append(f"s: {st['success']}")
+            if st["queued"]:
+                inner.append(f"q: {st['queued']}")
+            if st["failed"]:
+                inner.append(f"f: {st['failed']}")
+            if st["success"] and elapsed_s > 0:
+                inner.append(f"rps: {st['success'] / elapsed_s:.1f}")
+            parts.append(f"{cmd}({', '.join(inner)})")
+
+        if parts:
+            line += "  " + "  ".join(parts)
         return line
 
     @staticmethod
-    def _build_render_str(slots: list, screen_lines: int, n: int) -> str:
-        """
-        Build the ANSI escape sequence that rewrites the progress block.
-
-        screen_lines: lines currently on screen (read from coord file).
-        n:            lines to render now (= len(slots)).
-
-        The cursor is left at the end of the last rendered line (no trailing
-        newline) so subsequent renders can reposition correctly.
-        """
-        out: List[str] = []
-        if screen_lines > 1:
-            out.append(f"\033[{screen_lines - 1}A")  # move up to first line
-        out.append("\r")
-        for i, s in enumerate(slots):
-            out.append("\033[2K")                     # clear current line
-            out.append(s.get("line", ""))
-            if i < n - 1:
-                out.append("\n")
-        return "".join(out)
+    def _build_render_str(
+        slots: list, screen_lines: int, elapsed_s: float, spinner_ch: str
+    ) -> str:
+        """Build the ANSI escape sequence that rewrites the single progress line."""
+        return "\r\033[2K" + Progress._build_consolidated_line(
+            slots, elapsed_s, spinner_ch
+        )
 
     def _render(self) -> None:
-        """Update the coord file and redraw the full progress block."""
-        my_line = self._build_line()
+        """Update the coord file and redraw the consolidated progress line."""
+        with self._lock:
+            cached  = self._cache_hits
+            success = self._requests_done
+            queued  = self._queue_size + self._active + self._paused
+            failed  = self._failed
+            ch = self._SPINNERS[self._spinner_idx % len(self._SPINNERS)]
+            self._spinner_idx += 1
 
-        # Phase 1: update the coord file (under flock so other processes see
-        # a consistent screen_lines value when they build their render strings).
         with self._flock():
             data = self._read_coord()
             old_screen = data["screen_lines"]
+            elapsed_s = time.time() - data.get("pipeline_start", time.time())
             for s in data["slots"]:
                 if s["slot"] == self._slot:
-                    s["line"] = my_line
+                    s["cached"]  = cached
+                    s["success"] = success
+                    s["queued"]  = queued
+                    s["failed"]  = failed
                     break
-            n = len(data["slots"])
-            render_str = self._build_render_str(data["slots"], old_screen, n)
-            data["screen_lines"] = n
+            render_str = self._build_render_str(data["slots"], old_screen, elapsed_s, ch)
+            data["screen_lines"] = 1
             self._write_coord(data)
-        # flock released — another process may now update its slot.
 
-        # Phase 2: write to stderr (under _output_lock so error/pause JSON
-        # lines never interleave with cursor-positioning sequences).
         with _output_lock:
             sys.stderr.write(render_str)
             sys.stderr.flush()
-            self._screen_lines = n
+            self._screen_lines = 1
 
 
 # Module-level progress instance; set by main() when --progress is active.
@@ -1306,9 +1396,11 @@ def cmd_mailboxes(args, pool: ConnectionPool, cache: Optional[Cache]):
             emit(mb)
     finally:
         if _progress:
+            _was_cached = getattr(_call_cached, "value", False)
             _progress.finish_call(
                 time.monotonic() - t0,
-                cached=getattr(_call_cached, "value", False),
+                cached_count=1 if _was_cached else 0,
+                success_count=0 if _was_cached else 1,
             )
 
 
@@ -1328,9 +1420,11 @@ def cmd_messages(args, pool: ConnectionPool, cache: Optional[Cache]):
                 emit(msg)
         finally:
             if _progress:
+                _was_cached = getattr(_call_cached, "value", False)
                 _progress.finish_call(
                     time.monotonic() - t0,
-                    cached=getattr(_call_cached, "value", False),
+                    cached_count=1 if _was_cached else 0,
+                    success_count=0 if _was_cached else 1,
                 )
 
     if not sys.stdin.isatty():
@@ -1370,8 +1464,11 @@ def cmd_messages(args, pool: ConnectionPool, cache: Optional[Cache]):
 
 def cmd_fetch(args, pool: ConnectionPool, cache: Optional[Cache]):
     no_att = getattr(args, "no_attachments", False)
+    fetch_size = getattr(args, "fetch_size", 1)
 
-    def process(mailbox: str, uid: int):
+    # -- per-UID wrapper used by the single-message and streaming paths -------
+
+    def process_one(mailbox: str, uid: int):
         if _progress:
             _progress.start_call()
         t0 = time.monotonic()
@@ -1382,15 +1479,42 @@ def cmd_fetch(args, pool: ConnectionPool, cache: Optional[Cache]):
                 emit(obj)
         finally:
             if _progress:
+                _was_cached = getattr(_call_cached, "value", False)
                 _progress.finish_call(
                     time.monotonic() - t0,
-                    cached=getattr(_call_cached, "value", False),
+                    cached_count=1 if _was_cached else 0,
+                    success_count=0 if _was_cached else 1,
+                )
+
+    # -- batch wrapper used when --fetch-size > 1 ----------------------------
+
+    def process_batch(mailbox: str, uids: List[int]):
+        n = len(uids)
+        if _progress:
+            _progress.start_call(n)
+        t0 = time.monotonic()
+        results: List[Dict] = []
+        cache_hits = 0
+        try:
+            results, cache_hits = op_fetch_batch(
+                pool, mailbox, uids, cache,
+                no_cache=args.no_cache, no_attachments=no_att,
+            )
+            for obj in results:
+                emit(obj)
+        finally:
+            if _progress:
+                _progress.finish_call(
+                    time.monotonic() - t0,
+                    cached_count=cache_hits,
+                    success_count=max(0, len(results) - cache_hits),
                 )
 
     if not sys.stdin.isatty():
-        ex = ThreadPoolExecutor(max_workers=args.pool_size)
-        try:
-            futs = []
+        if fetch_size > 1:
+            # Batched mode: buffer stdin grouped by mailbox, then submit
+            # fixed-size chunks so each thread issues one multi-UID FETCH.
+            by_mailbox: Dict[str, List[int]] = {}
             for line in sys.stdin:
                 if _shutdown.is_set():
                     break
@@ -1398,26 +1522,63 @@ def cmd_fetch(args, pool: ConnectionPool, cache: Optional[Cache]):
                 if not line:
                     continue
                 try:
-                    obj = json.loads(line)
+                    msg = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                if obj.get("type") == "message" and obj.get("mailbox") and obj.get("uid"):
-                    if _progress:
-                        _progress.add_queue(1)
-                    futs.append(ex.submit(process, obj["mailbox"], int(obj["uid"])))
-            for f in as_completed(futs):
-                if _shutdown.is_set():
-                    break
-                try:
-                    f.result()
-                except Exception as exc:
-                    emit_err(str(exc))
-        finally:
-            ex.shutdown(wait=False, cancel_futures=True)
+                if msg.get("type") == "message" and msg.get("mailbox") and msg.get("uid"):
+                    mb = msg["mailbox"]
+                    by_mailbox.setdefault(mb, []).append(int(msg["uid"]))
+
+            ex = ThreadPoolExecutor(max_workers=args.pool_size)
+            try:
+                futs = []
+                for mb, uids in by_mailbox.items():
+                    for i in range(0, len(uids), fetch_size):
+                        batch = uids[i : i + fetch_size]
+                        if _progress:
+                            _progress.add_queue(len(batch))
+                        futs.append(ex.submit(process_batch, mb, batch))
+                for f in as_completed(futs):
+                    if _shutdown.is_set():
+                        break
+                    try:
+                        f.result()
+                    except Exception as exc:
+                        emit_err(str(exc))
+            finally:
+                ex.shutdown(wait=False, cancel_futures=True)
+        else:
+            # Streaming mode (default): submit one task per UID as it arrives
+            ex = ThreadPoolExecutor(max_workers=args.pool_size)
+            try:
+                futs = []
+                for line in sys.stdin:
+                    if _shutdown.is_set():
+                        break
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if obj.get("type") == "message" and obj.get("mailbox") and obj.get("uid"):
+                        if _progress:
+                            _progress.add_queue(1)
+                        futs.append(ex.submit(process_one, obj["mailbox"], int(obj["uid"])))
+                for f in as_completed(futs):
+                    if _shutdown.is_set():
+                        break
+                    try:
+                        f.result()
+                    except Exception as exc:
+                        emit_err(str(exc))
+            finally:
+                ex.shutdown(wait=False, cancel_futures=True)
     elif getattr(args, "mailbox", None) and getattr(args, "uid", None) is not None:
         if _progress:
             _progress.add_queue(1)
-        process(args.mailbox, int(args.uid))
+        process_one(args.mailbox, int(args.uid))
     else:
         emit_err("Provide --mailbox + --uid or pipe message JSON Lines from stdin.")
 
@@ -1528,6 +1689,11 @@ def build_parser() -> argparse.ArgumentParser:
     fp.add_argument("--mailbox", "-m")
     fp.add_argument("--uid", "-u", type=int)
     fp.add_argument("--no-attachments", action="store_true")
+    fp.add_argument("--fetch-size", type=int, default=1, metavar="N",
+                    help="Batch N messages per IMAP FETCH call when reading from stdin "
+                         "(default 1 = one message per request). "
+                         "Higher values reduce round-trips at the cost of larger "
+                         "individual responses. Ignored with --mailbox/--uid.")
 
     return p
 
@@ -1586,7 +1752,7 @@ def main():
 
     global _progress
     if getattr(args, "progress", False):
-        _progress = Progress(_CMD_LABEL.get(args.command, args.command))
+        _progress = Progress(args.command)
         _progress.start()
 
     try:
