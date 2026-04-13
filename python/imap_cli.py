@@ -1209,9 +1209,9 @@ class Progress:
         Build a single progress line combining the spinner/elapsed/totals prefix
         with per-command-type stats aggregated across all pipeline slots:
 
-            \ 3m19.2s  requests=2041  errors=5  mailboxes(c: 10, s: 20)  messages(s: 68000, q: 120000)  fetch(s: 68000, q: 120000, f: 100)
+            \ 3m19.2s  requests=2041  errors=5  mailboxes(c: 10, s: 20, rps: 1.2)  messages(s: 68000, q: 120000, rps: 45.3)  fetch(s: 68000, q: 120000, f: 100, rps: 23.1)
 
-        c=cached  s=success  q=queued/in-flight  f=failed
+        c=cached  s=success  q=queued/in-flight  f=failed  rps=messages/sec
         c, q, f are omitted when zero.
         """
         total_requests = sum(s.get("success", 0) for s in slots)
@@ -1236,6 +1236,7 @@ class Progress:
             if cmd not in by_cmd:
                 continue
             st = by_cmd[cmd]
+            total_done = st["cached"] + st["success"]
             inner: List[str] = []
             if st["cached"]:
                 inner.append(f"c: {st['cached']}")
@@ -1244,6 +1245,8 @@ class Progress:
                 inner.append(f"q: {st['queued']}")
             if st["failed"]:
                 inner.append(f"f: {st['failed']}")
+            if total_done and elapsed_s > 0:
+                inner.append(f"rps: {total_done / elapsed_s:.1f}")
             parts.append(f"{cmd}({', '.join(inner)})")
 
         if parts:
