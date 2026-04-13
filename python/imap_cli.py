@@ -999,6 +999,8 @@ class Progress:
     Cross-process coord-file access is serialised by an exclusive flock.
     """
 
+    _SPINNERS = r'|/-\\'
+
     def __init__(self, cmd_name: str) -> None:
         self._cmd_name = cmd_name
         self._pid = os.getpid()
@@ -1011,6 +1013,7 @@ class Progress:
         self._errors: int = 0          # total error events emitted
         self._failed: int = 0          # requests that exhausted all retries
         self._paused: int = 0          # threads currently sleeping in backoff
+        self._spinner_idx: int = 0
         self._running: bool = False
         self._tty: bool = sys.stderr.isatty()
         self._thread: Optional[threading.Thread] = None
@@ -1034,6 +1037,8 @@ class Progress:
         self._lock_path  = os.path.join(_PROGRESS_DIR, f"{pgid}.lock")
         with self._flock():
             data = self._read_coord()
+            if "pipeline_start" not in data:
+                data["pipeline_start"] = time.time()
             self._slot = len(data["slots"])
             data["slots"].append({
                 "pid":     self._pid,
@@ -1071,6 +1076,7 @@ class Progress:
 
         with self._flock():
             data = self._read_coord()
+            elapsed_s = time.time() - data.get("pipeline_start", time.time())
             for s in data["slots"]:
                 if s["slot"] == self._slot:
                     s["done"]    = True
@@ -1080,7 +1086,7 @@ class Progress:
                     s["failed"]  = failed
                     break
             old_screen = data["screen_lines"]
-            render_str = self._build_render_str(data["slots"], old_screen)
+            render_str = self._build_render_str(data["slots"], old_screen, elapsed_s, "-")
             all_done = all(s["done"] for s in data["slots"])
             data["screen_lines"] = 1
             self._write_coord(data)
@@ -1196,16 +1202,25 @@ class Progress:
             time.sleep(0.1)
 
     @staticmethod
-    def _build_consolidated_line(slots: list) -> str:
+    def _build_consolidated_line(
+        slots: list, elapsed_s: float, spinner_ch: str
+    ) -> str:
         """
-        Aggregate stats across all slots by command type and return a single
-        progress line in the format:
+        Build a single progress line combining the spinner/elapsed/totals prefix
+        with per-command-type stats aggregated across all pipeline slots:
 
-            mailboxes(c: 10, s: 20)  messages(s: 68000, q: 120000)  fetch(s: 68000, q: 120000, f: 100)
+            \ 3m19.2s  requests=2041  errors=5  mailboxes(c: 10, s: 20)  messages(s: 68000, q: 120000)  fetch(s: 68000, q: 120000, f: 100)
 
         c=cached  s=success  q=queued/in-flight  f=failed
         c, q, f are omitted when zero.
         """
+        total_requests = sum(s.get("success", 0) for s in slots)
+        total_errors   = sum(s.get("failed",  0) for s in slots)
+
+        line = f"{spinner_ch} {_fmt_elapsed(elapsed_s)}  requests={total_requests}"
+        if total_errors:
+            line += f"  errors={total_errors}"
+
         by_cmd: Dict[str, Dict[str, int]] = {}
         for s in slots:
             cmd = s.get("cmd", "")
@@ -1230,12 +1245,19 @@ class Progress:
             if st["failed"]:
                 inner.append(f"f: {st['failed']}")
             parts.append(f"{cmd}({', '.join(inner)})")
-        return "  ".join(parts)
+
+        if parts:
+            line += "  " + "  ".join(parts)
+        return line
 
     @staticmethod
-    def _build_render_str(slots: list, screen_lines: int) -> str:
+    def _build_render_str(
+        slots: list, screen_lines: int, elapsed_s: float, spinner_ch: str
+    ) -> str:
         """Build the ANSI escape sequence that rewrites the single progress line."""
-        return "\r\033[2K" + Progress._build_consolidated_line(slots)
+        return "\r\033[2K" + Progress._build_consolidated_line(
+            slots, elapsed_s, spinner_ch
+        )
 
     def _render(self) -> None:
         """Update the coord file and redraw the consolidated progress line."""
@@ -1244,10 +1266,13 @@ class Progress:
             success = self._requests_done
             queued  = self._queue_size + self._active + self._paused
             failed  = self._failed
+            ch = self._SPINNERS[self._spinner_idx % len(self._SPINNERS)]
+            self._spinner_idx += 1
 
         with self._flock():
             data = self._read_coord()
             old_screen = data["screen_lines"]
+            elapsed_s = time.time() - data.get("pipeline_start", time.time())
             for s in data["slots"]:
                 if s["slot"] == self._slot:
                     s["cached"]  = cached
@@ -1255,7 +1280,7 @@ class Progress:
                     s["queued"]  = queued
                     s["failed"]  = failed
                     break
-            render_str = self._build_render_str(data["slots"], old_screen)
+            render_str = self._build_render_str(data["slots"], old_screen, elapsed_s, ch)
             data["screen_lines"] = 1
             self._write_coord(data)
 
