@@ -834,6 +834,120 @@ def op_fetch(pool: ConnectionPool, mailbox: str, uid: int,
     return obj
 
 
+def op_fetch_batch(
+    pool: ConnectionPool,
+    mailbox: str,
+    uids: List[int],
+    cache: Optional[Cache],
+    no_cache: bool,
+    no_attachments: bool,
+) -> Tuple[List[Dict], bool]:
+    """
+    Fetch multiple full messages from one mailbox in a single IMAP FETCH call.
+
+    Cache hits are resolved locally first; only the uncached UIDs hit the
+    network.  All results are cached individually after the batch fetch.
+
+    Returns (results, all_cached).  all_cached is True only when every UID in
+    the batch was served from the local cache (no IMAP round-trip occurred).
+    """
+    results: List[Dict] = []
+    uncached: List[int] = []
+
+    for uid in uids:
+        if not no_cache and cache:
+            cached_obj = cache.get_message_content(mailbox, uid)
+            if cached_obj is not None:
+                log.debug("fetch_batch: cache hit %s/%d", mailbox, uid)
+                results.append(cached_obj)
+                continue
+        uncached.append(uid)
+
+    if not uncached:
+        return results, True  # every UID was a cache hit — no network needed
+
+    data: Optional[Dict] = None
+    last_exc: Optional[Exception] = None
+
+    for attempt in range(pool.max_retries):
+        try:
+            with pool.acquire() as conn:
+                conn.select_folder(mailbox, readonly=True)
+                fetch_props = [
+                    "ENVELOPE", "FLAGS", "RFC822.SIZE", "INTERNALDATE", "RFC822",
+                    *conn._additional_fetch_properties,
+                ]
+                log.debug("fetch_batch: fetching %d uids from %s", len(uncached), mailbox)
+                data = conn.fetch(uncached, fetch_props)
+            pool.on_success()
+            break
+        except Exception as exc:
+            last_exc = exc
+            data = None
+            delay = 5 * (2 ** attempt)
+            pool.on_throttle(delay)
+            if attempt < pool.max_retries - 1:
+                if _progress:
+                    _progress.start_pause()
+                try:
+                    emit_pause(delay, api="fetch", mailbox=mailbox,
+                               attempt=attempt + 1, error=str(exc))
+                finally:
+                    if _progress:
+                        _progress.end_pause()
+    else:
+        emit_err(str(last_exc), api="fetch", mailbox=mailbox,
+                 error_code=_imap_error_code(last_exc), failed=True)
+        return results, False
+
+    if data is None:
+        return results, False
+
+    for uid in uncached:
+        if uid not in data:
+            continue
+        item = data[uid]
+        env_raw = item.get(b"ENVELOPE")
+        if env_raw is None:
+            continue
+        env = parse_envelope(env_raw)
+        internal_date_raw = item.get(b"INTERNALDATE")
+        raw = item.get(b"RFC822", b"")
+        body_text, body_html, atts = parse_body(raw)
+        hdrs = parse_headers(raw)
+
+        obj: Dict = {
+            "type": "message_content",
+            "mailbox": mailbox,
+            "uid": uid,
+            **env,
+            "internal_date": parse_date(internal_date_raw) if internal_date_raw else "",
+            "size": item.get(b"RFC822.SIZE", 0),
+            "flags": flags_to_list(item.get(b"FLAGS", [])),
+            "headers": hdrs,
+            "body_text": body_text,
+            "body_html": body_html,
+            "attachments": [] if no_attachments else atts,
+        }
+
+        for prop in [b"X-GM-LABELS", b"X-GM-MSGID", b"X-GM-THRID"]:
+            if prop in item:
+                value = item.get(prop)
+                if value is None:
+                    continue
+                if isinstance(value, (list, tuple)):
+                    value = [l if isinstance(l, str) else l.decode("utf-8") for l in value]
+                elif isinstance(value, bytes):
+                    value = value.decode("utf-8")
+                obj[prop.decode("utf-8")] = value
+
+        if cache:
+            cache.set_message_content(mailbox, uid, obj)
+        results.append(obj)
+
+    return results, False
+
+
 # ---------------------------------------------------------------------------
 # Output helpers
 # ---------------------------------------------------------------------------
@@ -1370,8 +1484,11 @@ def cmd_messages(args, pool: ConnectionPool, cache: Optional[Cache]):
 
 def cmd_fetch(args, pool: ConnectionPool, cache: Optional[Cache]):
     no_att = getattr(args, "no_attachments", False)
+    fetch_size = getattr(args, "fetch_size", 1)
 
-    def process(mailbox: str, uid: int):
+    # -- per-UID wrapper used by the single-message and streaming paths -------
+
+    def process_one(mailbox: str, uid: int):
         if _progress:
             _progress.start_call()
         t0 = time.monotonic()
@@ -1387,10 +1504,28 @@ def cmd_fetch(args, pool: ConnectionPool, cache: Optional[Cache]):
                     cached=getattr(_call_cached, "value", False),
                 )
 
-    if not sys.stdin.isatty():
-        ex = ThreadPoolExecutor(max_workers=args.pool_size)
+    # -- batch wrapper used when --fetch-size > 1 ----------------------------
+
+    def process_batch(mailbox: str, uids: List[int]):
+        if _progress:
+            _progress.start_call()
+        t0 = time.monotonic()
         try:
-            futs = []
+            results, all_cached = op_fetch_batch(
+                pool, mailbox, uids, cache,
+                no_cache=args.no_cache, no_attachments=no_att,
+            )
+            for obj in results:
+                emit(obj)
+        finally:
+            if _progress:
+                _progress.finish_call(time.monotonic() - t0, cached=all_cached)
+
+    if not sys.stdin.isatty():
+        if fetch_size > 1:
+            # Batched mode: buffer stdin grouped by mailbox, then submit
+            # fixed-size chunks so each thread issues one multi-UID FETCH.
+            by_mailbox: Dict[str, List[int]] = {}
             for line in sys.stdin:
                 if _shutdown.is_set():
                     break
@@ -1398,26 +1533,63 @@ def cmd_fetch(args, pool: ConnectionPool, cache: Optional[Cache]):
                 if not line:
                     continue
                 try:
-                    obj = json.loads(line)
+                    msg = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                if obj.get("type") == "message" and obj.get("mailbox") and obj.get("uid"):
-                    if _progress:
-                        _progress.add_queue(1)
-                    futs.append(ex.submit(process, obj["mailbox"], int(obj["uid"])))
-            for f in as_completed(futs):
-                if _shutdown.is_set():
-                    break
-                try:
-                    f.result()
-                except Exception as exc:
-                    emit_err(str(exc))
-        finally:
-            ex.shutdown(wait=False, cancel_futures=True)
+                if msg.get("type") == "message" and msg.get("mailbox") and msg.get("uid"):
+                    mb = msg["mailbox"]
+                    by_mailbox.setdefault(mb, []).append(int(msg["uid"]))
+
+            ex = ThreadPoolExecutor(max_workers=args.pool_size)
+            try:
+                futs = []
+                for mb, uids in by_mailbox.items():
+                    for i in range(0, len(uids), fetch_size):
+                        batch = uids[i : i + fetch_size]
+                        if _progress:
+                            _progress.add_queue(1)
+                        futs.append(ex.submit(process_batch, mb, batch))
+                for f in as_completed(futs):
+                    if _shutdown.is_set():
+                        break
+                    try:
+                        f.result()
+                    except Exception as exc:
+                        emit_err(str(exc))
+            finally:
+                ex.shutdown(wait=False, cancel_futures=True)
+        else:
+            # Streaming mode (default): submit one task per UID as it arrives
+            ex = ThreadPoolExecutor(max_workers=args.pool_size)
+            try:
+                futs = []
+                for line in sys.stdin:
+                    if _shutdown.is_set():
+                        break
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if obj.get("type") == "message" and obj.get("mailbox") and obj.get("uid"):
+                        if _progress:
+                            _progress.add_queue(1)
+                        futs.append(ex.submit(process_one, obj["mailbox"], int(obj["uid"])))
+                for f in as_completed(futs):
+                    if _shutdown.is_set():
+                        break
+                    try:
+                        f.result()
+                    except Exception as exc:
+                        emit_err(str(exc))
+            finally:
+                ex.shutdown(wait=False, cancel_futures=True)
     elif getattr(args, "mailbox", None) and getattr(args, "uid", None) is not None:
         if _progress:
             _progress.add_queue(1)
-        process(args.mailbox, int(args.uid))
+        process_one(args.mailbox, int(args.uid))
     else:
         emit_err("Provide --mailbox + --uid or pipe message JSON Lines from stdin.")
 
@@ -1528,6 +1700,11 @@ def build_parser() -> argparse.ArgumentParser:
     fp.add_argument("--mailbox", "-m")
     fp.add_argument("--uid", "-u", type=int)
     fp.add_argument("--no-attachments", action="store_true")
+    fp.add_argument("--fetch-size", type=int, default=1, metavar="N",
+                    help="Batch N messages per IMAP FETCH call when reading from stdin "
+                         "(default 1 = one message per request). "
+                         "Higher values reduce round-trips at the cost of larger "
+                         "individual responses. Ignored with --mailbox/--uid.")
 
     return p
 
