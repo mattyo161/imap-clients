@@ -1245,8 +1245,8 @@ class Progress:
                 inner.append(f"q: {st['queued']}")
             if st["failed"]:
                 inner.append(f"f: {st['failed']}")
-            if total_done and elapsed_s > 0:
-                inner.append(f"rps: {total_done / elapsed_s:.1f}")
+            if st["success"] and elapsed_s > 0:
+                inner.append(f"rps: {st['success'] / elapsed_s:.1f}")
             parts.append(f"{cmd}({', '.join(inner)})")
 
         if parts:
