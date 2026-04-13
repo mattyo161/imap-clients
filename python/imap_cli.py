@@ -857,7 +857,7 @@ def op_fetch_batch(
         if not no_cache and cache:
             cached_obj = cache.get_message_content(mailbox, uid)
             if cached_obj is not None:
-                log.debug("fetch_batch: cache hit %s/%d", mailbox, uid)
+                # log.debug("fetch_batch: cache hit %s/%d", mailbox, uid)
                 results.append(cached_obj)
                 continue
         uncached.append(uid)
